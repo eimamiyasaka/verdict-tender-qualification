@@ -1,0 +1,628 @@
+// Verdict — Prisma schema.
+//
+// Generated from docs/spec.md §7, which is the binding source for every model,
+// field and index name here. Conventions (§7.1):
+//   - models are PascalCase singular, tables are snake_case plural via @@map
+//   - fields are camelCase, columns are snake_case via @map
+//   - every PK is a uuid; every table has createdAt; money is Decimal(14,2)
+//   - every org-owned table carries orgId with a cascade-delete relation to
+//     Organisation, so the §6.3 tenancy rule is one identical expression everywhere
+//   - DateTime is timestamptz; date-only fields are @db.Date
+//
+// Two invariants Prisma cannot express (constraint shape, citation bounds) live
+// as raw SQL appended to prisma/migrations/*_init/migration.sql — see §7.8.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  // Pooled (Supavisor transaction mode, :6543, ?pgbouncer=true&connection_limit=1) — app runtime.
+  url       = env("DATABASE_URL")
+  // Direct (session mode, :5432) — `prisma migrate` only. See .env.example and §7.9.
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// §7.2 Enums — values mirror contracts.ts and must not drift
+// ---------------------------------------------------------------------------
+
+enum OrgRole {
+  owner
+  admin
+  member
+}
+
+enum TenderStatus {
+  draft
+  extracting
+  extraction_failed
+  extracted
+  assessed
+  bidding
+  submitted
+  won
+  lost
+  abandoned
+}
+
+enum DocumentType {
+  contract_notice
+  specification
+  psq
+  itt
+  pricing_schedule
+  terms_and_conditions
+  evaluation_methodology
+  clarification_log
+  other
+}
+
+enum ExtractionStatus {
+  pending
+  running
+  complete
+  failed
+}
+
+enum RequirementKind {
+  certification
+  financial
+  insurance
+  experience
+  policy
+  legal_status
+  resource
+  question
+  date
+  other
+}
+
+enum Obligation {
+  mandatory
+  desirable
+  informational
+}
+
+enum Verdict {
+  pass
+  fail
+  unknown
+  not_applicable
+}
+
+enum BidRecommendation {
+  bid
+  no_bid
+  review
+}
+
+enum TaskStatus {
+  not_started
+  in_progress
+  in_review
+  complete
+}
+
+enum FinancialMetric {
+  annual_turnover
+  net_assets
+  profit_before_tax
+  current_ratio
+  credit_score
+}
+
+enum InsuranceType {
+  employers_liability
+  public_liability
+  professional_indemnity
+  product_liability
+  cyber
+  contract_works
+  motor_fleet
+}
+
+enum KeyDateKind {
+  clarification_deadline
+  submission_deadline
+  site_visit
+  presentation
+  award_notification
+  contract_start
+  contract_end
+}
+
+// ---------------------------------------------------------------------------
+// §7.3 Identity and tenancy
+// ---------------------------------------------------------------------------
+
+/// Mirror of Supabase auth.users. `id` EQUALS the Supabase auth user id and is
+/// supplied on insert, never generated. Written only by ensureUser() and the seed.
+model User {
+  id          String   @id @db.Uuid
+  email       String   @unique
+  displayName String?  @map("display_name")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  memberships       Membership[]
+  tendersCreated    Tender[]
+  assessmentsRun    Assessment[]
+  resultsOverridden AssessmentResult[]
+  bidTasksAssigned  BidTask[]
+  responsesUpdated  Response[]
+  events            Event[]
+
+  @@map("users")
+}
+
+model Organisation {
+  id                   String   @id @default(uuid()) @db.Uuid
+  name                 String
+  companiesHouseNumber String?  @map("companies_house_number")
+  headcount            Int?
+  /// `England`, `Scotland`, ...
+  registeredRegion     String?  @map("registered_region")
+  sicCodes             String[] @default([]) @map("sic_codes")
+  createdAt            DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  memberships          Membership[]
+  credentials          Credential[]
+  financialYears       FinancialYear[]
+  insurances           Insurance[]
+  pastProjects         PastProject[]
+  policies             Policy[]
+  tenders              Tender[]
+  tenderDocuments      TenderDocument[]
+  requirements         Requirement[]
+  requirementCitations RequirementCitation[]
+  keyDates             KeyDate[]
+  assessments          Assessment[]
+  assessmentResults    AssessmentResult[]
+  bidTasks             BidTask[]
+  responses            Response[]
+  libraryAnswers       LibraryAnswer[]
+  events               Event[]
+
+  @@map("organisations")
+}
+
+/// A user belongs to exactly one organisation in v1 (getOrgContext() throws otherwise).
+model Membership {
+  id        String   @id @default(uuid()) @db.Uuid
+  orgId     String   @map("org_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  role      OrgRole  @default(member)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+  @@map("memberships")
+}
+
+// ---------------------------------------------------------------------------
+// §7.4 Supplier capability — the ENTIRE evidence surface the evaluator reads
+// (plus Organisation.headcount and Organisation.registeredRegion)
+// ---------------------------------------------------------------------------
+
+/// Reference data. Seeded, not user-editable, not org-scoped.
+model CredentialType {
+  code      String   @id
+  /// Display name
+  label     String
+  /// `quality`, `security`, `hs`, `environmental`
+  category  String?
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  credentials Credential[]
+
+  @@map("credential_types")
+}
+
+model Credential {
+  id          String    @id @default(uuid()) @db.Uuid
+  orgId       String    @map("org_id") @db.Uuid
+  code        String
+  /// Certificate number
+  reference   String?
+  issuedOn    DateTime? @map("issued_on") @db.Date
+  /// null means DOES NOT EXPIRE — the evaluator must treat null as valid, never as missing.
+  expiresOn   DateTime? @map("expires_on") @db.Date
+  evidenceUrl String?   @map("evidence_url")
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation   Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  credentialType CredentialType @relation(fields: [code], references: [code], onDelete: Restrict)
+
+  @@unique([orgId, code])
+  @@index([orgId])
+  @@map("credentials")
+}
+
+/// A row may exist with a null metric. That is the case that produces `unknown`
+/// rather than `fail` (§9).
+model FinancialYear {
+  id              String   @id @default(uuid()) @db.Uuid
+  orgId           String   @map("org_id") @db.Uuid
+  yearEnding      DateTime @map("year_ending") @db.Date
+  turnover        Decimal? @db.Decimal(14, 2)
+  netAssets       Decimal? @map("net_assets") @db.Decimal(14, 2)
+  profitBeforeTax Decimal? @map("profit_before_tax") @db.Decimal(14, 2)
+  currency        String   @default("GBP") @db.Char(3)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, yearEnding])
+  @@index([orgId, yearEnding])
+  @@map("financial_years")
+}
+
+model Insurance {
+  id          String        @id @default(uuid()) @db.Uuid
+  orgId       String        @map("org_id") @db.Uuid
+  kind        InsuranceType
+  coverAmount Decimal       @map("cover_amount") @db.Decimal(14, 2)
+  currency    String        @default("GBP") @db.Char(3)
+  insurer     String?
+  expiresOn   DateTime?     @map("expires_on") @db.Date
+  createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, kind])
+  @@index([orgId])
+  @@map("insurances")
+}
+
+model PastProject {
+  id                 String    @id @default(uuid()) @db.Uuid
+  orgId              String    @map("org_id") @db.Uuid
+  clientName         String    @map("client_name")
+  title              String
+  description        String?
+  contractValue      Decimal?  @map("contract_value") @db.Decimal(14, 2)
+  currency           String    @default("GBP") @db.Char(3)
+  /// `healthcare`, `local_government`, `education`, ...
+  sector             String?
+  startedOn          DateTime? @map("started_on") @db.Date
+  /// null means ongoing
+  endedOn            DateTime? @map("ended_on") @db.Date
+  isPublicSector     Boolean   @default(false) @map("is_public_sector")
+  refereeContactable Boolean   @default(false) @map("referee_contactable")
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, endedOn])
+  @@map("past_projects")
+}
+
+model Policy {
+  id           String    @id @default(uuid()) @db.Uuid
+  orgId        String    @map("org_id") @db.Uuid
+  /// `modern_slavery`, `equality`, `environmental`, `health_safety`, `data_protection`
+  policyType   String    @map("policy_type")
+  title        String?
+  lastReviewed DateTime? @map("last_reviewed") @db.Date
+  documentUrl  String?   @map("document_url")
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, policyType])
+  @@index([orgId])
+  @@map("policies")
+}
+
+// ---------------------------------------------------------------------------
+// §7.5 Tender side
+// ---------------------------------------------------------------------------
+
+model Tender {
+  id              String       @id @default(uuid()) @db.Uuid
+  orgId           String       @map("org_id") @db.Uuid
+  title           String
+  buyerName       String?      @map("buyer_name")
+  /// `find_a_tender`, `contracts_finder`, `manual`
+  source          String?
+  /// OCID or notice id
+  noticeReference String?      @map("notice_reference")
+  sourceUrl       String?      @map("source_url")
+  contractValue   Decimal?     @map("contract_value") @db.Decimal(14, 2)
+  currency        String?      @default("GBP") @db.Char(3)
+  /// Shown in the metadata line as "48 months"
+  durationMonths  Int?         @map("duration_months")
+  lotReference    String?      @map("lot_reference")
+  status          TenderStatus @default(draft)
+  createdById     String?      @map("created_by_id") @db.Uuid
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  createdBy    User?        @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  documents      TenderDocument[]
+  requirements   Requirement[]
+  keyDates       KeyDate[]
+  assessments    Assessment[]
+  bidTasks       BidTask[]
+  libraryAnswers LibraryAnswer[]
+
+  @@index([orgId, status])
+  @@map("tenders")
+}
+
+model TenderDocument {
+  id               String           @id @default(uuid()) @db.Uuid
+  tenderId         String           @map("tender_id") @db.Uuid
+  orgId            String           @map("org_id") @db.Uuid
+  /// As displayed in citations — `PSQ.pdf`
+  filename         String
+  docType          DocumentType     @default(other) @map("doc_type")
+  /// Seeded packs: `/packs/nhs/psq.pdf`. Runtime uploads: null (§6.4).
+  filePath         String?          @map("file_path")
+  pageCount        Int?             @map("page_count")
+  extractionStatus ExtractionStatus @default(pending) @map("extraction_status")
+  /// The user-facing message, stored verbatim
+  extractionError  String?          @map("extraction_error")
+  uploadedAt       DateTime         @default(now()) @map("uploaded_at") @db.Timestamptz(6)
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tender       Tender       @relation(fields: [tenderId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  requirements Requirement[]
+  citations    RequirementCitation[]
+  keyDates     KeyDate[]
+
+  @@index([tenderId])
+  @@map("tender_documents")
+}
+
+/// The core table. Invariant 1 — no citation, no requirement: documentId,
+/// pageNumber and quotedClause are NOT NULL at the database level.
+/// Invariant 2 (constraint shape by kind) and the citation bounds are raw SQL
+/// CHECK constraints in the init migration (§7.8).
+model Requirement {
+  id                   String          @id @default(uuid()) @db.Uuid
+  tenderId             String          @map("tender_id") @db.Uuid
+  orgId                String          @map("org_id") @db.Uuid
+  kind                 RequirementKind
+  obligation           Obligation      @default(mandatory)
+  /// One line, human readable, shown in the matrix
+  summary              String
+  /// A `RequirementConstraint` from contracts.ts
+  constraintJson       Json            @map("constraint_json")
+  documentId           String          @map("document_id") @db.Uuid
+  /// > 0 (CHECK page_number_positive)
+  pageNumber           Int             @map("page_number")
+  /// 1–1200 chars, verbatim (CHECK quoted_clause_length)
+  quotedClause         String          @map("quoted_clause")
+  /// `4.2.1`, `Appendix C`
+  clauseReference      String?         @map("clause_reference")
+  /// `Method Statement 3` — kind = question only
+  questionRef          String?         @map("question_ref")
+  /// kind = question only
+  wordLimit            Int?            @map("word_limit")
+  /// Percentage of total score
+  weighting            Decimal?        @db.Decimal(5, 2)
+  /// 0–1
+  extractionConfidence Decimal?        @map("extraction_confidence") @db.Decimal(3, 2)
+  createdAt            DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tender       Tender         @relation(fields: [tenderId], references: [id], onDelete: Cascade)
+  organisation Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  document     TenderDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  citations         RequirementCitation[]
+  assessmentResults AssessmentResult[]
+  bidTasks          BidTask[]
+  response          Response?
+
+  @@index([tenderId, obligation])
+  @@index([tenderId, kind])
+  @@index([documentId])
+  @@map("requirements")
+}
+
+/// Additional citations for a deduplicated requirement. When the same obligation
+/// appears in the PSQ and the ITT, one Requirement survives and the losing
+/// draft's provenance lands here.
+model RequirementCitation {
+  id              String   @id @default(uuid()) @db.Uuid
+  requirementId   String   @map("requirement_id") @db.Uuid
+  orgId           String   @map("org_id") @db.Uuid
+  documentId      String   @map("document_id") @db.Uuid
+  pageNumber      Int      @map("page_number")
+  quotedClause    String   @map("quoted_clause")
+  clauseReference String?  @map("clause_reference")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  requirement  Requirement    @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  organisation Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  document     TenderDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([requirementId])
+  @@map("requirement_citations")
+}
+
+/// The submission deadline the evaluator uses is the earliest KeyDate with
+/// kind = submission_deadline — resolved only by getSubmissionDeadline(tenderId).
+model KeyDate {
+  id           String      @id @default(uuid()) @db.Uuid
+  tenderId     String      @map("tender_id") @db.Uuid
+  orgId        String      @map("org_id") @db.Uuid
+  kind         KeyDateKind
+  occursAt     DateTime    @map("occurs_at") @db.Timestamptz(6)
+  documentId   String?     @map("document_id") @db.Uuid
+  pageNumber   Int?        @map("page_number")
+  quotedClause String?     @map("quoted_clause")
+  createdAt    DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tender       Tender          @relation(fields: [tenderId], references: [id], onDelete: Cascade)
+  organisation Organisation    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  document     TenderDocument? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  @@index([tenderId, occursAt])
+  @@map("key_dates")
+}
+
+// ---------------------------------------------------------------------------
+// §7.6 Assessment
+// ---------------------------------------------------------------------------
+
+/// Immutable. Never updated after insert (Invariant 3). Editing the profile
+/// creates version n+1; version allocation takes an advisory lock on
+/// hashtext(tenderId) inside an interactive transaction.
+model Assessment {
+  id               String            @id @default(uuid()) @db.Uuid
+  tenderId         String            @map("tender_id") @db.Uuid
+  orgId            String            @map("org_id") @db.Uuid
+  /// 1-based, per tender
+  version          Int
+  recommendation   BidRecommendation
+  mandatoryTotal   Int               @default(0) @map("mandatory_total")
+  mandatoryPassed  Int               @default(0) @map("mandatory_passed")
+  mandatoryFailed  Int               @default(0) @map("mandatory_failed")
+  mandatoryUnknown Int               @default(0) @map("mandatory_unknown")
+  /// 0–100 coverage of desirable requirements
+  desirableScore   Decimal?          @map("desirable_score") @db.Decimal(5, 2)
+  /// One-paragraph human-readable summary
+  rationale        String?
+  /// The deadline the run evaluated against — what makes an old assessment re-explainable
+  deadlineUsed     DateTime?         @map("deadline_used") @db.Timestamptz(6)
+  /// The clock the run evaluated against
+  asOfUsed         DateTime          @map("as_of_used") @db.Timestamptz(6)
+  runById          String?           @map("run_by_id") @db.Uuid
+  createdAt        DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  tender       Tender       @relation(fields: [tenderId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  runBy        User?        @relation(fields: [runById], references: [id], onDelete: SetNull)
+
+  results AssessmentResult[]
+
+  @@unique([tenderId, version])
+  @@index([tenderId, version])
+  @@map("assessments")
+}
+
+model AssessmentResult {
+  id             String   @id @default(uuid()) @db.Uuid
+  assessmentId   String   @map("assessment_id") @db.Uuid
+  requirementId  String   @map("requirement_id") @db.Uuid
+  orgId          String   @map("org_id") @db.Uuid
+  verdict        Verdict
+  /// Quantitative, rendered verbatim in the UI
+  rationale      String
+  /// `EvidenceRef[]` from contracts.ts
+  evidence       Json     @default("[]")
+  /// e.g. certificate expiring 12 days before the deadline
+  warning        String?
+  overriddenById String?  @map("overridden_by_id") @db.Uuid
+  overrideNote   String?  @map("override_note")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  assessment   Assessment   @relation(fields: [assessmentId], references: [id], onDelete: Cascade)
+  requirement  Requirement  @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  overriddenBy User?        @relation(fields: [overriddenById], references: [id], onDelete: SetNull)
+
+  @@unique([assessmentId, requirementId])
+  @@index([assessmentId, verdict])
+  @@index([requirementId])
+  @@map("assessment_results")
+}
+
+// ---------------------------------------------------------------------------
+// §7.7 Workspace and audit
+// ---------------------------------------------------------------------------
+
+model BidTask {
+  id            String     @id @default(uuid()) @db.Uuid
+  tenderId      String     @map("tender_id") @db.Uuid
+  orgId         String     @map("org_id") @db.Uuid
+  requirementId String?    @map("requirement_id") @db.Uuid
+  title         String
+  assigneeId    String?    @map("assignee_id") @db.Uuid
+  status        TaskStatus @default(not_started)
+  dueOn         DateTime?  @map("due_on") @db.Date
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime   @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  tender       Tender       @relation(fields: [tenderId], references: [id], onDelete: Cascade)
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  requirement  Requirement? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
+  assignee     User?        @relation(fields: [assigneeId], references: [id], onDelete: SetNull)
+
+  @@index([tenderId, status])
+  @@index([assigneeId])
+  @@map("bid_tasks")
+}
+
+/// Word count is computed in TypeScript (countWords in src/lib/text.ts), never
+/// by the database — no generated column here, deliberately.
+model Response {
+  id             String   @id @default(uuid()) @db.Uuid
+  requirementId  String   @unique @map("requirement_id") @db.Uuid
+  orgId          String   @map("org_id") @db.Uuid
+  body           String   @default("")
+  sourceAnswerId String?  @map("source_answer_id") @db.Uuid
+  updatedById    String?  @map("updated_by_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  requirement  Requirement    @relation(fields: [requirementId], references: [id], onDelete: Cascade)
+  organisation Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sourceAnswer LibraryAnswer? @relation(fields: [sourceAnswerId], references: [id], onDelete: SetNull)
+  updatedBy    User?          @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@map("responses")
+}
+
+/// v1 retrieval is ILIKE over title and body plus tag overlap — no tsvector, no embeddings (§4).
+model LibraryAnswer {
+  id             String   @id @default(uuid()) @db.Uuid
+  orgId          String   @map("org_id") @db.Uuid
+  title          String
+  body           String
+  tags           String[] @default([])
+  sourceTenderId String?  @map("source_tender_id") @db.Uuid
+  timesUsed      Int      @default(0) @map("times_used")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  sourceTender Tender?      @relation(fields: [sourceTenderId], references: [id], onDelete: SetNull)
+
+  responses Response[]
+
+  @@index([orgId])
+  @@map("library_answers")
+}
+
+/// Append-only. Nothing updates or deletes here. Every state-changing write in
+/// src/lib/db/ appends exactly one event in the same transaction as the change.
+model Event {
+  id           BigInt   @id @default(autoincrement())
+  orgId        String   @map("org_id") @db.Uuid
+  actorId      String?  @map("actor_id") @db.Uuid
+  /// `user`, `system`, `model`
+  actorKind    String   @default("user") @map("actor_kind")
+  /// `tender.created`, `document.uploaded`, `extraction.completed`, `assessment.run`, `result.overridden`, `profile.updated`
+  action       String
+  subjectTable String?  @map("subject_table")
+  subjectId    String?  @map("subject_id") @db.Uuid
+  payload      Json     @default("{}")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  actor        User?        @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([orgId, createdAt])
+  @@index([subjectTable, subjectId])
+  @@map("events")
+}
