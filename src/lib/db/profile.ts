@@ -1,11 +1,15 @@
 /**
- * Company profile (§7.4) — the five capability tables plus organisation
- * details. Every write appends one `profile.updated` event, which is what
- * tells a tender its assessment may be stale (§14).
+ * The company profile (§7.4) — the five capability tables plus organisation
+ * details, and `getCapabilitySnapshot`, which is the **entire** evidence surface
+ * `evaluate()` reads. If the evaluator needs a fact that is not in the snapshot,
+ * the answer is `unknown`, not a new field.
  *
- * Prisma seam: each upsert becomes `prisma.<model>.upsert` inside a
- * transaction with the event insert.
+ * Every write appends one `profile.updated` event in the same transaction as the
+ * change. That event is what tells a tender its assessment may be stale (§14)
+ * and what the profile screen reads to list the tenders worth re-running.
  */
+
+import type { CapabilitySnapshot, InsuranceType as ContractInsuranceType } from "../../../contracts";
 import { INSURANCE_TYPE_LABEL, policyTypeLabel } from "@/lib/labels";
 import type {
   Credential,
@@ -20,141 +24,443 @@ import type {
   ProfileView,
   UsageCount,
 } from "@/lib/types";
-import { appendEvent, clone, getStore, newId } from "./_placeholder/store";
+import { asJsonArray, prisma, toDecimal, toDecimalRequired, toNumber, toNumberRequired, type Db, type Tx } from "./client";
+import { appendEvent, getLastProfileChangeAt } from "./events";
+import { getOrganisation, toOrganisation } from "./org";
 
-function usage(orgId: string, predicate: (constraint: Record<string, unknown>, kind: string) => boolean): UsageCount {
-  const store = getStore();
-  const tenders = new Set<string>();
-  let requirements = 0;
-  for (const r of store.requirements) {
-    if (r.orgId !== orgId) continue;
-    if (predicate(r.constraintJson as Record<string, unknown>, r.kind)) {
-      requirements += 1;
-      tenders.add(r.tenderId);
-    }
-  }
-  return { requirements, tenders: tenders.size };
+/* ---------------------------------------------------------------------------
+ * Mappers
+ * ------------------------------------------------------------------------- */
+
+type Decimalish = { toNumber(): number };
+
+function toCredential(row: {
+  id: string;
+  orgId: string;
+  code: string;
+  reference: string | null;
+  issuedOn: Date | null;
+  expiresOn: Date | null;
+  evidenceUrl: string | null;
+  createdAt: Date;
+}): Credential {
+  return { ...row };
 }
 
-/** Projects are "used" where the latest assessment of a tender counted them as evidence. */
-function projectUsage(orgId: string, projectId: string): UsageCount {
-  const store = getStore();
-  const latestByTender = new Map<string, string>();
-  for (const a of store.assessments) {
-    if (a.orgId !== orgId) continue;
-    const current = latestByTender.get(a.tenderId);
-    const currentVersion = current ? store.assessments.find((x) => x.id === current)!.version : -1;
-    if (a.version > currentVersion) latestByTender.set(a.tenderId, a.id);
-  }
-  const latestIds = new Set(latestByTender.values());
-  const tenders = new Set<string>();
-  let requirements = 0;
-  for (const r of store.results) {
-    if (!latestIds.has(r.assessmentId)) continue;
-    if (r.evidence.some((e) => e.table === "past_projects" && e.id === projectId && e.matched)) {
-      requirements += 1;
-      const a = store.assessments.find((x) => x.id === r.assessmentId)!;
-      tenders.add(a.tenderId);
-    }
-  }
-  return { requirements, tenders: tenders.size };
+function toFinancialYear(row: {
+  id: string;
+  orgId: string;
+  yearEnding: Date;
+  turnover: Decimalish | null;
+  netAssets: Decimalish | null;
+  profitBeforeTax: Decimalish | null;
+  currency: string;
+  createdAt: Date;
+}): FinancialYear {
+  return {
+    id: row.id,
+    orgId: row.orgId,
+    yearEnding: row.yearEnding,
+    // A null metric is the `unknown` case (§9) — never coerced to zero.
+    turnover: toNumber(row.turnover as never),
+    netAssets: toNumber(row.netAssets as never),
+    profitBeforeTax: toNumber(row.profitBeforeTax as never),
+    currency: row.currency,
+    createdAt: row.createdAt,
+  };
 }
 
+function toInsurance(row: {
+  id: string;
+  orgId: string;
+  kind: string;
+  coverAmount: Decimalish;
+  currency: string;
+  insurer: string | null;
+  expiresOn: Date | null;
+  createdAt: Date;
+}): Insurance {
+  return {
+    id: row.id,
+    orgId: row.orgId,
+    kind: row.kind as InsuranceType,
+    coverAmount: toNumberRequired(row.coverAmount as never),
+    currency: row.currency,
+    insurer: row.insurer,
+    expiresOn: row.expiresOn,
+    createdAt: row.createdAt,
+  };
+}
+
+function toPastProject(row: {
+  id: string;
+  orgId: string;
+  clientName: string;
+  title: string;
+  description: string | null;
+  contractValue: Decimalish | null;
+  currency: string;
+  sector: string | null;
+  startedOn: Date | null;
+  endedOn: Date | null;
+  isPublicSector: boolean;
+  refereeContactable: boolean;
+  createdAt: Date;
+}): PastProject {
+  return {
+    id: row.id,
+    orgId: row.orgId,
+    clientName: row.clientName,
+    title: row.title,
+    description: row.description,
+    contractValue: toNumber(row.contractValue as never),
+    currency: row.currency,
+    sector: row.sector,
+    startedOn: row.startedOn,
+    endedOn: row.endedOn,
+    isPublicSector: row.isPublicSector,
+    refereeContactable: row.refereeContactable,
+    createdAt: row.createdAt,
+  };
+}
+
+function toPolicy(row: {
+  id: string;
+  orgId: string;
+  policyType: string;
+  title: string | null;
+  lastReviewed: Date | null;
+  documentUrl: string | null;
+  createdAt: Date;
+}): Policy {
+  return { ...row };
+}
+
+function toCredentialType(row: { code: string; label: string; category: string | null }): CredentialType {
+  return { code: row.code, label: row.label, category: row.category as CredentialType["category"] };
+}
+
+/* ---------------------------------------------------------------------------
+ * The evidence surface
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Spec §7.4: these five tables plus `headcount` and `registeredRegion` are the
+ * whole of what the evaluator may see. Loaded in one round trip so a run is a
+ * consistent picture of the profile rather than five reads that could interleave
+ * with an edit.
+ */
+export async function getCapabilitySnapshot(
+  orgId: string,
+  db: Db = prisma,
+): Promise<CapabilitySnapshot> {
+  const organisation = await db.organisation.findUnique({
+    where: { id: orgId },
+    include: {
+      credentials: { orderBy: { code: "asc" } },
+      financialYears: { orderBy: { yearEnding: "desc" } },
+      insurances: { orderBy: { kind: "asc" } },
+      pastProjects: { orderBy: { endedOn: "desc" } },
+      policies: { orderBy: { policyType: "asc" } },
+    },
+  });
+  if (!organisation) throw new Error("Organisation not found");
+
+  return {
+    orgId,
+    headcount: organisation.headcount,
+    registeredRegion: organisation.registeredRegion,
+    credentials: organisation.credentials.map((row) => ({
+      id: row.id,
+      code: row.code,
+      reference: row.reference,
+      issuedOn: row.issuedOn,
+      // Null means DOES NOT EXPIRE. It never means missing (§7.4, §9, §14).
+      expiresOn: row.expiresOn,
+    })),
+    financialYears: organisation.financialYears.map((row) => ({
+      id: row.id,
+      yearEnding: row.yearEnding,
+      turnover: toNumber(row.turnover),
+      netAssets: toNumber(row.netAssets),
+      profitBeforeTax: toNumber(row.profitBeforeTax),
+      currency: row.currency,
+    })),
+    insurances: organisation.insurances.map((row) => ({
+      id: row.id,
+      kind: row.kind as ContractInsuranceType,
+      coverAmount: toNumberRequired(row.coverAmount),
+      currency: row.currency,
+      insurer: row.insurer,
+      expiresOn: row.expiresOn,
+    })),
+    pastProjects: organisation.pastProjects.map((row) => ({
+      id: row.id,
+      clientName: row.clientName,
+      title: row.title,
+      contractValue: toNumber(row.contractValue),
+      currency: row.currency,
+      sector: row.sector,
+      startedOn: row.startedOn,
+      // Null means ongoing.
+      endedOn: row.endedOn,
+      isPublicSector: row.isPublicSector,
+      refereeContactable: row.refereeContactable,
+    })),
+    policies: organisation.policies.map((row) => ({
+      id: row.id,
+      policyType: row.policyType,
+      title: row.title,
+      lastReviewed: row.lastReviewed,
+    })),
+  };
+}
+
+/** Reference data (§7.4): seeded, not user-editable, and not org-scoped. */
 export async function listCredentialTypes(): Promise<CredentialType[]> {
-  return clone(getStore().credentialTypes);
+  const rows = await prisma.credentialType.findMany({ orderBy: { label: "asc" } });
+  return rows.map(toCredentialType);
+}
+
+/* ---------------------------------------------------------------------------
+ * The profile screen (§10.3)
+ * ------------------------------------------------------------------------- */
+
+const EMPTY_USAGE: UsageCount = { requirements: 0, tenders: 0 };
+
+/**
+ * "Used by N requirements across M tenders" (§10.3) — what makes filling the
+ * profile in feel worth doing rather than like a form. Counted from the org's
+ * requirements in one pass rather than one query per row.
+ */
+function countUsage(
+  requirements: Array<{ tenderId: string; kind: string; constraint: Record<string, unknown> }>,
+  predicate: (constraint: Record<string, unknown>, kind: string) => boolean,
+): UsageCount {
+  const tenders = new Set<string>();
+  let count = 0;
+  for (const requirement of requirements) {
+    if (!predicate(requirement.constraint, requirement.kind)) continue;
+    count += 1;
+    tenders.add(requirement.tenderId);
+  }
+  return { requirements: count, tenders: tenders.size };
 }
 
 export async function getProfile(orgId: string): Promise<ProfileView | null> {
-  const store = getStore();
-  const organisation = store.organisations.find((o) => o.id === orgId);
+  const organisation = await prisma.organisation.findUnique({
+    where: { id: orgId },
+    include: {
+      credentials: true,
+      financialYears: { orderBy: { yearEnding: "desc" } },
+      insurances: true,
+      pastProjects: true,
+      policies: true,
+    },
+  });
   if (!organisation) return null;
 
-  const years = store.financialYears
-    .filter((f) => f.orgId === orgId)
-    .sort((a, b) => b.yearEnding.getTime() - a.yearEnding.getTime());
+  const [credentialTypeRows, requirementRows, lastProfileChange] = await Promise.all([
+    prisma.credentialType.findMany({ orderBy: { label: "asc" } }),
+    prisma.requirement.findMany({
+      where: { orgId },
+      select: { tenderId: true, kind: true, constraintJson: true },
+    }),
+    getLastProfileChangeAt(orgId),
+  ]);
 
-  const profileEvents = store.events.filter((e) => e.orgId === orgId && e.action === "profile.updated");
-  const lastChange = profileEvents.reduce<Date | null>((max, e) => (!max || e.createdAt > max ? e.createdAt : max), null);
-  const staleAssessments: ProfileView["staleAssessments"] = [];
-  if (lastChange) {
-    for (const tender of store.tenders.filter((t) => t.orgId === orgId)) {
-      const latest = store.assessments.filter((a) => a.tenderId === tender.id).sort((a, b) => b.version - a.version)[0];
-      if (latest && latest.createdAt < lastChange) staleAssessments.push({ id: tender.id, title: tender.title });
+  const credentialTypes = credentialTypeRows.map(toCredentialType);
+  const requirements = requirementRows.map((row) => ({
+    tenderId: row.tenderId,
+    kind: row.kind as string,
+    constraint: (row.constraintJson ?? {}) as Record<string, unknown>,
+  }));
+
+  /* --- Which past projects an assessment actually counted --- */
+
+  const latestAssessments = await prisma.assessment.findMany({
+    where: { orgId },
+    orderBy: [{ tenderId: "asc" }, { version: "desc" }],
+    distinct: ["tenderId"],
+    select: { id: true, tenderId: true, createdAt: true },
+  });
+  const assessmentTender = new Map(latestAssessments.map((a) => [a.id, a.tenderId]));
+  const resultRows = latestAssessments.length
+    ? await prisma.assessmentResult.findMany({
+        where: { orgId, assessmentId: { in: latestAssessments.map((a) => a.id) } },
+        select: { assessmentId: true, evidence: true },
+      })
+    : [];
+
+  const projectUsage = new Map<string, { requirements: number; tenders: Set<string> }>();
+  for (const result of resultRows) {
+    const tenderId = assessmentTender.get(result.assessmentId);
+    if (!tenderId) continue;
+    for (const entry of asJsonArray(result.evidence as never)) {
+      const ref = entry as { source?: string; table?: string; id?: string; counted?: boolean; matched?: boolean };
+      const isProject = ref.source === "past_project" || ref.table === "past_projects";
+      const counted = ref.counted ?? ref.matched ?? false;
+      if (!isProject || !counted || !ref.id) continue;
+      const usage = projectUsage.get(ref.id) ?? { requirements: 0, tenders: new Set<string>() };
+      usage.requirements += 1;
+      usage.tenders.add(tenderId);
+      projectUsage.set(ref.id, usage);
     }
   }
 
-  // Gaps: what requirements ask for that the profile lacks. This is what makes
-  // profile completion feel worth doing rather than like a form (§10.3).
-  const heldCodes = new Set(store.credentials.filter((c) => c.orgId === orgId).map((c) => c.code));
-  const heldKinds = new Set(store.insurances.filter((i) => i.orgId === orgId).map((i) => i.kind));
-  const heldPolicies = new Set(store.policies.filter((p) => p.orgId === orgId).map((p) => p.policyType));
-  const gapMap = { credentials: new Map<string, ProfileGap>(), insurances: new Map<string, ProfileGap>(), policies: new Map<string, ProfileGap>() };
-  const tendersByGap = new Map<string, Set<string>>();
-  for (const r of store.requirements) {
-    if (r.orgId !== orgId) continue;
-    const c = r.constraintJson as Record<string, unknown>;
-    let bucket: keyof typeof gapMap | null = null;
+  /* --- Tenders whose latest assessment predates the last profile change --- */
+
+  const staleAssessments: ProfileView["staleAssessments"] = [];
+  if (lastProfileChange) {
+    const staleTenderIds = latestAssessments
+      .filter((assessment) => assessment.createdAt < lastProfileChange)
+      .map((assessment) => assessment.tenderId);
+    if (staleTenderIds.length > 0) {
+      const tenders = await prisma.tender.findMany({
+        where: { orgId, id: { in: staleTenderIds } },
+        select: { id: true, title: true },
+        orderBy: { title: "asc" },
+      });
+      staleAssessments.push(...tenders);
+    }
+  }
+
+  /* --- Gaps: what requirements ask for that the profile does not hold --- */
+
+  const heldCodes = new Set(organisation.credentials.map((c) => c.code));
+  const heldKinds = new Set(organisation.insurances.map((i) => i.kind as string));
+  const heldPolicies = new Set(organisation.policies.map((p) => p.policyType));
+  const gapBuckets = {
+    credentials: new Map<string, ProfileGap & { tenders: Set<string> }>(),
+    insurances: new Map<string, ProfileGap & { tenders: Set<string> }>(),
+    policies: new Map<string, ProfileGap & { tenders: Set<string> }>(),
+  };
+
+  for (const requirement of requirements) {
+    const constraint = requirement.constraint;
+    let bucket: keyof typeof gapBuckets | null = null;
     let key = "";
     let label = "";
-    if (r.kind === "certification" && typeof c.credential_code === "string" && !heldCodes.has(c.credential_code)) {
+    if (
+      requirement.kind === "certification" &&
+      typeof constraint.credential_code === "string" &&
+      !heldCodes.has(constraint.credential_code)
+    ) {
       bucket = "credentials";
-      key = c.credential_code;
-      label = store.credentialTypes.find((t) => t.code === key)?.label ?? key;
-    } else if (r.kind === "insurance" && typeof c.insurance_kind === "string" && !heldKinds.has(c.insurance_kind as InsuranceType)) {
+      key = constraint.credential_code;
+      label = credentialTypes.find((type) => type.code === key)?.label ?? key;
+    } else if (
+      requirement.kind === "insurance" &&
+      typeof constraint.insurance_kind === "string" &&
+      !heldKinds.has(constraint.insurance_kind)
+    ) {
       bucket = "insurances";
-      key = c.insurance_kind;
+      key = constraint.insurance_kind;
       label = INSURANCE_TYPE_LABEL[key as InsuranceType] ?? key;
-    } else if (r.kind === "policy" && typeof c.policy_type === "string" && !heldPolicies.has(c.policy_type)) {
+    } else if (
+      requirement.kind === "policy" &&
+      typeof constraint.policy_type === "string" &&
+      !heldPolicies.has(constraint.policy_type)
+    ) {
       bucket = "policies";
-      key = c.policy_type;
+      key = constraint.policy_type;
       label = policyTypeLabel(key);
     }
     if (!bucket) continue;
-    const gap = gapMap[bucket].get(key) ?? { key, label, usage: { requirements: 0, tenders: 0 } };
+    const gap =
+      gapBuckets[bucket].get(key) ??
+      ({ key, label, usage: { requirements: 0, tenders: 0 }, tenders: new Set<string>() } as ProfileGap & {
+        tenders: Set<string>;
+      });
     gap.usage.requirements += 1;
-    const set = tendersByGap.get(`${bucket}:${key}`) ?? new Set<string>();
-    set.add(r.tenderId);
-    tendersByGap.set(`${bucket}:${key}`, set);
-    gap.usage.tenders = set.size;
-    gapMap[bucket].set(key, gap);
+    gap.tenders.add(requirement.tenderId);
+    gap.usage.tenders = gap.tenders.size;
+    gapBuckets[bucket].set(key, gap);
   }
-  const sortGaps = (m: Map<string, ProfileGap>) => Array.from(m.values()).sort((a, b) => b.usage.requirements - a.usage.requirements);
+
+  const sortGaps = (bucket: Map<string, ProfileGap & { tenders: Set<string> }>): ProfileGap[] =>
+    Array.from(bucket.values())
+      .map(({ key, label, usage }) => ({ key, label, usage }))
+      .sort((a, b) => b.usage.requirements - a.usage.requirements || a.label.localeCompare(b.label));
+
+  const credentialTypeByCode = new Map(credentialTypes.map((type) => [type.code, type]));
 
   return {
-    organisation: clone(organisation),
-    gaps: { credentials: sortGaps(gapMap.credentials), insurances: sortGaps(gapMap.insurances), policies: sortGaps(gapMap.policies) },
-    credentialTypes: clone(store.credentialTypes),
-    credentials: store.credentials
-      .filter((c) => c.orgId === orgId)
-      .map((c) => ({
-        ...clone(c),
-        type: clone(store.credentialTypes.find((t) => t.code === c.code) ?? { code: c.code, label: c.code, category: null }),
-        usage: usage(orgId, (k, kind) => kind === "certification" && k.credential_code === c.code),
+    organisation: toOrganisation(organisation),
+    credentialTypes,
+    gaps: {
+      credentials: sortGaps(gapBuckets.credentials),
+      insurances: sortGaps(gapBuckets.insurances),
+      policies: sortGaps(gapBuckets.policies),
+    },
+    credentials: organisation.credentials
+      .map((row) => ({
+        ...toCredential(row),
+        type: credentialTypeByCode.get(row.code) ?? { code: row.code, label: row.code, category: null },
+        usage: countUsage(
+          requirements,
+          (constraint, kind) => kind === "certification" && constraint.credential_code === row.code,
+        ),
       }))
       .sort((a, b) => a.type.label.localeCompare(b.type.label)),
-    financialYears: years.map((f, rank) => ({
-      ...clone(f),
-      // A financial requirement over N years reads the N most recent years.
-      usage: usage(orgId, (k, kind) => kind === "financial" && rank < Math.max(1, Number(k.years ?? 1))),
+    financialYears: organisation.financialYears.map((row, rank) => ({
+      ...toFinancialYear(row),
+      // A financial requirement over N years reads the N most recent filed years.
+      usage: countUsage(requirements, (constraint, kind) => {
+        if (kind !== "financial") return false;
+        const years = Number(constraint.years_required ?? constraint.years ?? 1);
+        return rank < Math.max(1, Number.isFinite(years) ? years : 1);
+      }),
     })),
-    insurances: store.insurances
-      .filter((i) => i.orgId === orgId)
-      .map((i) => ({ ...clone(i), usage: usage(orgId, (k, kind) => kind === "insurance" && k.insurance_kind === i.kind) }))
+    insurances: organisation.insurances
+      .map((row) => ({
+        ...toInsurance(row),
+        usage: countUsage(
+          requirements,
+          (constraint, kind) => kind === "insurance" && constraint.insurance_kind === row.kind,
+        ),
+      }))
       .sort((a, b) => a.kind.localeCompare(b.kind)),
-    pastProjects: store.pastProjects
-      .filter((p) => p.orgId === orgId)
-      .map((p) => ({ ...clone(p), usage: projectUsage(orgId, p.id) }))
-      .sort((a, b) => (b.endedOn?.getTime() ?? Number.MAX_SAFE_INTEGER) - (a.endedOn?.getTime() ?? Number.MAX_SAFE_INTEGER)),
-    policies: store.policies
-      .filter((p) => p.orgId === orgId)
-      .map((p) => ({ ...clone(p), usage: usage(orgId, (k, kind) => kind === "policy" && k.policy_type === p.policyType) }))
+    pastProjects: organisation.pastProjects
+      .map((row) => {
+        const usage = projectUsage.get(row.id);
+        return {
+          ...toPastProject(row),
+          usage: usage ? { requirements: usage.requirements, tenders: usage.tenders.size } : { ...EMPTY_USAGE },
+        };
+      })
+      .sort(
+        (a, b) =>
+          (b.endedOn?.getTime() ?? Number.MAX_SAFE_INTEGER) -
+          (a.endedOn?.getTime() ?? Number.MAX_SAFE_INTEGER),
+      ),
+    policies: organisation.policies
+      .map((row) => ({
+        ...toPolicy(row),
+        usage: countUsage(
+          requirements,
+          (constraint, kind) => kind === "policy" && constraint.policy_type === row.policyType,
+        ),
+      }))
       .sort((a, b) => a.policyType.localeCompare(b.policyType)),
     staleAssessments,
   };
 }
 
-function recordChange(orgId: string, userId: string, section: string, change: "added" | "updated" | "removed", label: string, subjectId: string) {
-  appendEvent(getStore(), {
+/* ---------------------------------------------------------------------------
+ * Writes. One transaction, one event, each time (§7.7).
+ * ------------------------------------------------------------------------- */
+
+async function recordChange(
+  tx: Tx,
+  orgId: string,
+  userId: string,
+  section: string,
+  change: "added" | "updated" | "removed",
+  label: string,
+  subjectId: string,
+): Promise<void> {
+  await appendEvent(tx, {
     orgId,
     actorId: userId,
     actorKind: "user",
@@ -165,173 +471,293 @@ function recordChange(orgId: string, userId: string, section: string, change: "a
   });
 }
 
-// ---------------------------------------------------------------------------
-// Organisation
-// ---------------------------------------------------------------------------
-
 export async function updateOrganisation(
   orgId: string,
   userId: string,
-  input: Pick<Organisation, "name" | "companiesHouseNumber" | "headcount" | "registeredRegion" | "sicCodes">,
+  input: Pick<
+    Organisation,
+    "name" | "companiesHouseNumber" | "headcount" | "registeredRegion" | "sicCodes"
+  >,
 ): Promise<Organisation> {
-  const store = getStore();
-  const org = store.organisations.find((o) => o.id === orgId);
-  if (!org) throw new Error("Organisation not found");
-  Object.assign(org, input);
-  recordChange(orgId, userId, "organisations", "updated", org.name, org.id);
-  return clone(org);
+  return prisma.$transaction(async (tx) => {
+    const row = await tx.organisation.update({ where: { id: orgId }, data: input });
+    await recordChange(tx, orgId, userId, "organisations", "updated", row.name, row.id);
+    return toOrganisation(row);
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Credentials
-// ---------------------------------------------------------------------------
+export type CredentialInput = Pick<
+  Credential,
+  "code" | "reference" | "issuedOn" | "expiresOn" | "evidenceUrl"
+>;
 
-export type CredentialInput = Pick<Credential, "code" | "reference" | "issuedOn" | "expiresOn" | "evidenceUrl">;
-
-export async function upsertCredential(orgId: string, userId: string, input: CredentialInput, id?: string): Promise<Credential> {
-  const store = getStore();
-  const type = store.credentialTypes.find((t) => t.code === input.code);
-  if (!type) throw new Error("Choose a certification from the list.");
-  const duplicate = store.credentials.find((c) => c.orgId === orgId && c.code === input.code && c.id !== id);
-  if (duplicate) throw new Error(`${type.label} is already on your profile. Edit the existing entry instead.`);
-  const existing = id ? store.credentials.find((c) => c.id === id && c.orgId === orgId) : undefined;
-  if (existing) {
-    Object.assign(existing, input);
-    recordChange(orgId, userId, "credentials", "updated", type.label, existing.id);
-    return clone(existing);
-  }
-  const row: Credential = { id: newId(), orgId, ...input, createdAt: new Date() };
-  store.credentials.push(row);
-  recordChange(orgId, userId, "credentials", "added", type.label, row.id);
-  return clone(row);
+export async function upsertCredential(
+  orgId: string,
+  userId: string,
+  input: CredentialInput,
+  id?: string,
+): Promise<Credential> {
+  return prisma.$transaction(async (tx) => {
+    const type = await tx.credentialType.findUnique({ where: { code: input.code } });
+    if (!type) throw new Error("Choose a certification from the list.");
+    const duplicate = await tx.credential.findFirst({
+      where: { orgId, code: input.code, ...(id ? { NOT: { id } } : {}) },
+    });
+    if (duplicate) {
+      throw new Error(`${type.label} is already on your profile. Edit the existing entry instead.`);
+    }
+    const existing = id ? await tx.credential.findFirst({ where: { id, orgId } }) : null;
+    const row = existing
+      ? await tx.credential.update({ where: { id: existing.id }, data: input })
+      : await tx.credential.create({ data: { orgId, ...input } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "credentials",
+      existing ? "updated" : "added",
+      type.label,
+      row.id,
+    );
+    return toCredential(row);
+  });
 }
 
 export async function deleteCredential(orgId: string, userId: string, id: string): Promise<void> {
-  const store = getStore();
-  const index = store.credentials.findIndex((c) => c.id === id && c.orgId === orgId);
-  if (index === -1) return;
-  const [removed] = store.credentials.splice(index, 1);
-  const label = store.credentialTypes.find((t) => t.code === removed.code)?.label ?? removed.code;
-  recordChange(orgId, userId, "credentials", "removed", label, id);
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.credential.findFirst({ where: { id, orgId } });
+    if (!existing) return;
+    const type = await tx.credentialType.findUnique({ where: { code: existing.code } });
+    await tx.credential.delete({ where: { id } });
+    await recordChange(tx, orgId, userId, "credentials", "removed", type?.label ?? existing.code, id);
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Financial years
-// ---------------------------------------------------------------------------
+export type FinancialYearInput = Pick<
+  FinancialYear,
+  "yearEnding" | "turnover" | "netAssets" | "profitBeforeTax" | "currency"
+>;
 
-export type FinancialYearInput = Pick<FinancialYear, "yearEnding" | "turnover" | "netAssets" | "profitBeforeTax" | "currency">;
-
-export async function upsertFinancialYear(orgId: string, userId: string, input: FinancialYearInput, id?: string): Promise<FinancialYear> {
-  const store = getStore();
-  const sameYear = store.financialYears.find(
-    (f) => f.orgId === orgId && f.id !== id && f.yearEnding.getTime() === input.yearEnding.getTime(),
-  );
-  if (sameYear) throw new Error("A financial year ending on that date is already on your profile.");
-  const existing = id ? store.financialYears.find((f) => f.id === id && f.orgId === orgId) : undefined;
-  const label = `FY${input.yearEnding.getFullYear()}`;
-  if (existing) {
-    Object.assign(existing, input);
-    recordChange(orgId, userId, "financial_years", "updated", label, existing.id);
-    return clone(existing);
-  }
-  const row: FinancialYear = { id: newId(), orgId, ...input, createdAt: new Date() };
-  store.financialYears.push(row);
-  recordChange(orgId, userId, "financial_years", "added", label, row.id);
-  return clone(row);
+export async function upsertFinancialYear(
+  orgId: string,
+  userId: string,
+  input: FinancialYearInput,
+  id?: string,
+): Promise<FinancialYear> {
+  return prisma.$transaction(async (tx) => {
+    const duplicate = await tx.financialYear.findFirst({
+      where: { orgId, yearEnding: input.yearEnding, ...(id ? { NOT: { id } } : {}) },
+    });
+    if (duplicate) {
+      throw new Error("A financial year ending on that date is already on your profile.");
+    }
+    const data = {
+      yearEnding: input.yearEnding,
+      turnover: toDecimal(input.turnover),
+      netAssets: toDecimal(input.netAssets),
+      profitBeforeTax: toDecimal(input.profitBeforeTax),
+      currency: input.currency,
+    };
+    const existing = id ? await tx.financialYear.findFirst({ where: { id, orgId } }) : null;
+    const row = existing
+      ? await tx.financialYear.update({ where: { id: existing.id }, data })
+      : await tx.financialYear.create({ data: { orgId, ...data } });
+    const label = `FY${input.yearEnding.getUTCFullYear()}`;
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "financial_years",
+      existing ? "updated" : "added",
+      label,
+      row.id,
+    );
+    return toFinancialYear(row);
+  });
 }
 
 export async function deleteFinancialYear(orgId: string, userId: string, id: string): Promise<void> {
-  const store = getStore();
-  const index = store.financialYears.findIndex((f) => f.id === id && f.orgId === orgId);
-  if (index === -1) return;
-  const [removed] = store.financialYears.splice(index, 1);
-  recordChange(orgId, userId, "financial_years", "removed", `FY${removed.yearEnding.getFullYear()}`, id);
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.financialYear.findFirst({ where: { id, orgId } });
+    if (!existing) return;
+    await tx.financialYear.delete({ where: { id } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "financial_years",
+      "removed",
+      `FY${existing.yearEnding.getUTCFullYear()}`,
+      id,
+    );
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Insurance
-// ---------------------------------------------------------------------------
+export type InsuranceInput = Pick<
+  Insurance,
+  "kind" | "coverAmount" | "currency" | "insurer" | "expiresOn"
+>;
 
-export type InsuranceInput = Pick<Insurance, "kind" | "coverAmount" | "currency" | "insurer" | "expiresOn">;
-
-export async function upsertInsurance(orgId: string, userId: string, input: InsuranceInput, id?: string): Promise<Insurance> {
-  const store = getStore();
-  const duplicate = store.insurances.find((i) => i.orgId === orgId && i.kind === input.kind && i.id !== id);
-  if (duplicate) throw new Error("A policy of that kind is already on your profile. Edit the existing entry instead.");
-  const existing = id ? store.insurances.find((i) => i.id === id && i.orgId === orgId) : undefined;
-  if (existing) {
-    Object.assign(existing, input);
-    recordChange(orgId, userId, "insurances", "updated", INSURANCE_TYPE_LABEL[input.kind], existing.id);
-    return clone(existing);
-  }
-  const row: Insurance = { id: newId(), orgId, ...input, createdAt: new Date() };
-  store.insurances.push(row);
-  recordChange(orgId, userId, "insurances", "added", INSURANCE_TYPE_LABEL[input.kind], row.id);
-  return clone(row);
+export async function upsertInsurance(
+  orgId: string,
+  userId: string,
+  input: InsuranceInput,
+  id?: string,
+): Promise<Insurance> {
+  return prisma.$transaction(async (tx) => {
+    const duplicate = await tx.insurance.findFirst({
+      where: { orgId, kind: input.kind, ...(id ? { NOT: { id } } : {}) },
+    });
+    if (duplicate) {
+      throw new Error(
+        "A policy of that kind is already on your profile. Edit the existing entry instead.",
+      );
+    }
+    const data = {
+      kind: input.kind,
+      coverAmount: toDecimalRequired(input.coverAmount),
+      currency: input.currency,
+      insurer: input.insurer,
+      expiresOn: input.expiresOn,
+    };
+    const existing = id ? await tx.insurance.findFirst({ where: { id, orgId } }) : null;
+    const row = existing
+      ? await tx.insurance.update({ where: { id: existing.id }, data })
+      : await tx.insurance.create({ data: { orgId, ...data } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "insurances",
+      existing ? "updated" : "added",
+      INSURANCE_TYPE_LABEL[input.kind],
+      row.id,
+    );
+    return toInsurance(row);
+  });
 }
 
 export async function deleteInsurance(orgId: string, userId: string, id: string): Promise<void> {
-  const store = getStore();
-  const index = store.insurances.findIndex((i) => i.id === id && i.orgId === orgId);
-  if (index === -1) return;
-  const [removed] = store.insurances.splice(index, 1);
-  recordChange(orgId, userId, "insurances", "removed", INSURANCE_TYPE_LABEL[removed.kind], id);
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.insurance.findFirst({ where: { id, orgId } });
+    if (!existing) return;
+    await tx.insurance.delete({ where: { id } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "insurances",
+      "removed",
+      INSURANCE_TYPE_LABEL[existing.kind as InsuranceType],
+      id,
+    );
+  });
 }
-
-// ---------------------------------------------------------------------------
-// Past projects
-// ---------------------------------------------------------------------------
 
 export type PastProjectInput = Omit<PastProject, "id" | "orgId" | "createdAt">;
 
-export async function upsertPastProject(orgId: string, userId: string, input: PastProjectInput, id?: string): Promise<PastProject> {
-  const store = getStore();
-  const existing = id ? store.pastProjects.find((p) => p.id === id && p.orgId === orgId) : undefined;
-  if (existing) {
-    Object.assign(existing, input);
-    recordChange(orgId, userId, "past_projects", "updated", `${input.clientName} — ${input.title}`, existing.id);
-    return clone(existing);
-  }
-  const row: PastProject = { id: newId(), orgId, ...input, createdAt: new Date() };
-  store.pastProjects.push(row);
-  recordChange(orgId, userId, "past_projects", "added", `${input.clientName} — ${input.title}`, row.id);
-  return clone(row);
+export async function upsertPastProject(
+  orgId: string,
+  userId: string,
+  input: PastProjectInput,
+  id?: string,
+): Promise<PastProject> {
+  return prisma.$transaction(async (tx) => {
+    const data = {
+      clientName: input.clientName,
+      title: input.title,
+      description: input.description,
+      contractValue: toDecimal(input.contractValue),
+      currency: input.currency,
+      sector: input.sector,
+      startedOn: input.startedOn,
+      endedOn: input.endedOn,
+      isPublicSector: input.isPublicSector,
+      refereeContactable: input.refereeContactable,
+    };
+    const existing = id ? await tx.pastProject.findFirst({ where: { id, orgId } }) : null;
+    const row = existing
+      ? await tx.pastProject.update({ where: { id: existing.id }, data })
+      : await tx.pastProject.create({ data: { orgId, ...data } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "past_projects",
+      existing ? "updated" : "added",
+      `${input.clientName} — ${input.title}`,
+      row.id,
+    );
+    return toPastProject(row);
+  });
 }
 
 export async function deletePastProject(orgId: string, userId: string, id: string): Promise<void> {
-  const store = getStore();
-  const index = store.pastProjects.findIndex((p) => p.id === id && p.orgId === orgId);
-  if (index === -1) return;
-  const [removed] = store.pastProjects.splice(index, 1);
-  recordChange(orgId, userId, "past_projects", "removed", `${removed.clientName} — ${removed.title}`, id);
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.pastProject.findFirst({ where: { id, orgId } });
+    if (!existing) return;
+    await tx.pastProject.delete({ where: { id } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "past_projects",
+      "removed",
+      `${existing.clientName} — ${existing.title}`,
+      id,
+    );
+  });
 }
-
-// ---------------------------------------------------------------------------
-// Policies
-// ---------------------------------------------------------------------------
 
 export type PolicyInput = Pick<Policy, "policyType" | "title" | "lastReviewed" | "documentUrl">;
 
-export async function upsertPolicy(orgId: string, userId: string, input: PolicyInput, id?: string): Promise<Policy> {
-  const store = getStore();
-  const duplicate = store.policies.find((p) => p.orgId === orgId && p.policyType === input.policyType && p.id !== id);
-  if (duplicate) throw new Error("A policy of that type is already on your profile. Edit the existing entry instead.");
-  const existing = id ? store.policies.find((p) => p.id === id && p.orgId === orgId) : undefined;
-  if (existing) {
-    Object.assign(existing, input);
-    recordChange(orgId, userId, "policies", "updated", policyTypeLabel(input.policyType), existing.id);
-    return clone(existing);
-  }
-  const row: Policy = { id: newId(), orgId, ...input, createdAt: new Date() };
-  store.policies.push(row);
-  recordChange(orgId, userId, "policies", "added", policyTypeLabel(input.policyType), row.id);
-  return clone(row);
+export async function upsertPolicy(
+  orgId: string,
+  userId: string,
+  input: PolicyInput,
+  id?: string,
+): Promise<Policy> {
+  return prisma.$transaction(async (tx) => {
+    const duplicate = await tx.policy.findFirst({
+      where: { orgId, policyType: input.policyType, ...(id ? { NOT: { id } } : {}) },
+    });
+    if (duplicate) {
+      throw new Error(
+        "A policy of that type is already on your profile. Edit the existing entry instead.",
+      );
+    }
+    const existing = id ? await tx.policy.findFirst({ where: { id, orgId } }) : null;
+    const row = existing
+      ? await tx.policy.update({ where: { id: existing.id }, data: input })
+      : await tx.policy.create({ data: { orgId, ...input } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "policies",
+      existing ? "updated" : "added",
+      policyTypeLabel(input.policyType),
+      row.id,
+    );
+    return toPolicy(row);
+  });
 }
 
 export async function deletePolicy(orgId: string, userId: string, id: string): Promise<void> {
-  const store = getStore();
-  const index = store.policies.findIndex((p) => p.id === id && p.orgId === orgId);
-  if (index === -1) return;
-  const [removed] = store.policies.splice(index, 1);
-  recordChange(orgId, userId, "policies", "removed", policyTypeLabel(removed.policyType), id);
+  await prisma.$transaction(async (tx) => {
+    const existing = await tx.policy.findFirst({ where: { id, orgId } });
+    if (!existing) return;
+    await tx.policy.delete({ where: { id } });
+    await recordChange(
+      tx,
+      orgId,
+      userId,
+      "policies",
+      "removed",
+      policyTypeLabel(existing.policyType),
+      id,
+    );
+  });
 }
+
+export { getOrganisation };

@@ -2,7 +2,7 @@
   "name": "verdict",
   "version": "0.1.0",
   "private": true,
-  "description": "Verdict — tender qualification platform. Next.js frontend, Prisma schema and migrations against Supabase Postgres, shared contracts and fixtures.",
+  "description": "Verdict \u2014 tender qualification platform. Next.js frontend, Prisma schema and migrations against Supabase Postgres, shared contracts and fixtures.",
   "scripts": {
     "dev": "next dev --turbopack",
     "build": "next build --turbopack",
@@ -14,13 +14,17 @@
     "postinstall": "prisma generate",
     "db:generate": "prisma generate",
     "db:validate": "prisma validate",
+    "db:seed": "tsx prisma/seed.ts",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:status": "prisma migrate status",
     "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
     "@prisma/client": "6.19.3",
+    "@supabase/ssr": "^0.12.6",
+    "@supabase/supabase-js": "^2.115.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.41.0",
@@ -43,8 +47,12 @@
     "eslint-config-next": "15.5.25",
     "prisma": "6.19.3",
     "tailwindcss": "^4",
+    "tsx": "^4.23.13",
     "typescript": "^5",
     "vitest": "^5.0.0"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
   },
   "engines": {
     "node": ">=20"

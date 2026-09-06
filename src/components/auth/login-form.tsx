@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { signInAction, viewDemoAction } from "@/lib/actions/auth";
 import { idleState } from "@/lib/actions/shared";
 
-export function LoginForm({ next, demoFailed }: { next: string | null; demoFailed: boolean }) {
+export function LoginForm({ next, notice }: { next: string | null; notice: string | null }) {
   const [state, action] = useActionState(signInAction, idleState);
 
   return (
@@ -41,9 +41,9 @@ export function LoginForm({ next, demoFailed }: { next: string | null; demoFaile
           Opens Meridian Facilities Ltd: three assessed tenders, a filled-in profile and a small answer library. No account
           needed.
         </p>
-        {demoFailed ? (
+        {notice ? (
           <p role="alert" className="text-center text-[13px] text-flag">
-            The demo account isn&apos;t configured. Set DEMO_EMAIL and DEMO_PASSWORD and try again.
+            {notice}
           </p>
         ) : null}
       </form>
