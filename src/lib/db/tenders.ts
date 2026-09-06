@@ -1,19 +1,277 @@
 /**
- * Tenders (§7.5) and the pipeline / tender-detail view models.
+ * Tenders (§7.5), the pipeline (§10.1) and the tender-detail view model (§10.2).
  *
- * Every function takes `orgId` from the session (§6.3), never from a URL or
- * form field. Prisma seam: each body becomes one query with the relations
- * included — the pipeline is one query with the latest assessment, no N+1.
+ * Every function takes `orgId` from the session (§6.3), never from a URL, a form
+ * field or a request body — including `getTenderDetail`, which is reached from a
+ * route parameter and therefore returns null rather than another organisation's
+ * tender when the two disagree.
  */
+
 import type {
+  Assessment,
   AssessmentWithResults,
+  KeyDate,
+  KeyDateKind,
   PipelineRow,
   Tender,
   TenderDetail,
   TenderSource,
   TenderStatus,
 } from "@/lib/types";
-import { appendEvent, clone, getStore, newId } from "./_placeholder/store";
+import { asJsonObject, prisma, toDecimal, toNumber, type Db, type Tx } from "./client";
+import { toAssessment, toAssessmentResult } from "./assessments";
+import { toDocument } from "./documents";
+import { appendEvent, getLastProfileChangeAt } from "./events";
+import { requirementSources, toRequirementWithSources } from "./requirements";
+
+/* ---------------------------------------------------------------------------
+ * The submission deadline — spec §7.5, and the one rule everything else reads.
+ *
+ * "The submission deadline the evaluator uses is the earliest KeyDate with
+ * kind = submission_deadline for that tender. That resolution lives in exactly
+ * one function, and nothing re-derives it."
+ *
+ * `pickSubmissionDeadline` is that function. `getSubmissionDeadline` is its
+ * database-backed entry point; the pipeline and the detail view already hold the
+ * tender's key dates and call the same picker over them rather than restating
+ * the rule as a second query.
+ * ------------------------------------------------------------------------- */
+
+const SUBMISSION_DEADLINE_KIND = "submission_deadline" as const;
+
+export function pickSubmissionDeadline(
+  keyDates: ReadonlyArray<{ kind: string; occursAt: Date }>,
+): Date | null {
+  let earliest: Date | null = null;
+  for (const keyDate of keyDates) {
+    if (keyDate.kind !== SUBMISSION_DEADLINE_KIND) continue;
+    if (earliest === null || keyDate.occursAt.getTime() < earliest.getTime()) {
+      earliest = keyDate.occursAt;
+    }
+  }
+  return earliest;
+}
+
+/** The deadline `runAssessment` evaluates against, and the one the UI shows. */
+export async function getSubmissionDeadline(
+  orgId: string,
+  tenderId: string,
+  db: Db = prisma,
+): Promise<Date | null> {
+  const rows = await db.keyDate.findMany({
+    where: { orgId, tenderId, kind: SUBMISSION_DEADLINE_KIND },
+    select: { kind: true, occursAt: true },
+  });
+  return pickSubmissionDeadline(rows);
+}
+
+/* ---------------------------------------------------------------------------
+ * Mappers
+ * ------------------------------------------------------------------------- */
+
+interface TenderRow {
+  id: string;
+  orgId: string;
+  title: string;
+  buyerName: string | null;
+  source: string | null;
+  noticeReference: string | null;
+  sourceUrl: string | null;
+  contractValue: { toNumber(): number } | null;
+  currency: string | null;
+  durationMonths: number | null;
+  lotReference: string | null;
+  status: string;
+  createdById: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export function toTender(row: TenderRow): Tender {
+  return {
+    id: row.id,
+    orgId: row.orgId,
+    title: row.title,
+    buyerName: row.buyerName,
+    source: row.source as TenderSource | null,
+    noticeReference: row.noticeReference,
+    sourceUrl: row.sourceUrl,
+    // Decimal(14,2) → number in major units. Read the seam in client.ts.
+    contractValue: toNumber(row.contractValue as never),
+    currency: row.currency,
+    durationMonths: row.durationMonths,
+    lotReference: row.lotReference,
+    status: row.status as TenderStatus,
+    createdById: row.createdById,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function toKeyDate(row: {
+  id: string;
+  tenderId: string;
+  orgId: string;
+  kind: string;
+  occursAt: Date;
+  documentId: string | null;
+  pageNumber: number | null;
+  quotedClause: string | null;
+  createdAt: Date;
+}): KeyDate {
+  return {
+    id: row.id,
+    tenderId: row.tenderId,
+    orgId: row.orgId,
+    kind: row.kind as KeyDateKind,
+    occursAt: row.occursAt,
+    documentId: row.documentId,
+    pageNumber: row.pageNumber,
+    quotedClause: row.quotedClause,
+    createdAt: row.createdAt,
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * Reads
+ * ------------------------------------------------------------------------- */
+
+/**
+ * The pipeline (§10.1). **One query**, with the latest assessment, the earliest
+ * submission deadline and the requirement count included — no N+1, and no view.
+ * Sorted by submission deadline ascending; a tender with no deadline yet sorts
+ * last rather than first, because an unknown date is not an urgent one.
+ */
+export async function listPipeline(orgId: string): Promise<PipelineRow[]> {
+  const rows = await prisma.tender.findMany({
+    where: { orgId },
+    include: {
+      assessments: { orderBy: { version: "desc" }, take: 1 },
+      keyDates: {
+        where: { kind: SUBMISSION_DEADLINE_KIND },
+        orderBy: { occursAt: "asc" },
+        take: 1,
+      },
+      _count: { select: { requirements: true } },
+    },
+  });
+
+  return rows
+    .map((row) => ({
+      tender: toTender(row),
+      latestAssessment: row.assessments[0] ? toAssessment(row.assessments[0]) : null,
+      submissionDeadline: pickSubmissionDeadline(row.keyDates),
+      requirementCount: row._count.requirements,
+    }))
+    .sort((a, b) => {
+      if (!a.submissionDeadline && !b.submissionDeadline) {
+        return b.tender.createdAt.getTime() - a.tender.createdAt.getTime();
+      }
+      if (!a.submissionDeadline) return 1;
+      if (!b.submissionDeadline) return -1;
+      return a.submissionDeadline.getTime() - b.submissionDeadline.getTime();
+    });
+}
+
+export async function listTenderSummaries(
+  orgId: string,
+): Promise<Array<Pick<Tender, "id" | "title" | "status">>> {
+  const rows = await prisma.tender.findMany({
+    where: { orgId },
+    select: { id: true, title: true, status: true },
+    orderBy: { title: "asc" },
+  });
+  return rows.map((row) => ({ id: row.id, title: row.title, status: row.status as TenderStatus }));
+}
+
+export async function getTender(orgId: string, tenderId: string): Promise<Tender | null> {
+  const row = await prisma.tender.findFirst({ where: { id: tenderId, orgId } });
+  return row ? toTender(row) : null;
+}
+
+/**
+ * Everything the four tabs render (§10.2). The requirements arrive with their
+ * citations, so the drawer never queries; the results arrive for the latest
+ * assessment only, because older versions are read one at a time from the audit
+ * tab and loading every result of every version would grow with history.
+ */
+export async function getTenderDetail(orgId: string, tenderId: string): Promise<TenderDetail | null> {
+  const row = await prisma.tender.findFirst({
+    where: { id: tenderId, orgId },
+    include: {
+      documents: { orderBy: { uploadedAt: "asc" } },
+      keyDates: { orderBy: { occursAt: "asc" } },
+      requirements: { include: requirementSources, orderBy: { createdAt: "asc" } },
+      assessments: { orderBy: { version: "desc" } },
+    },
+  });
+  if (!row) return null;
+
+  const versions = row.assessments.map(toAssessment);
+  const latest = row.assessments[0] ?? null;
+  const results = latest
+    ? await prisma.assessmentResult.findMany({
+        where: { assessmentId: latest.id, orgId },
+        orderBy: { createdAt: "asc" },
+      })
+    : [];
+  const latestAssessment: AssessmentWithResults | null = latest
+    ? { ...toAssessment(latest), results: results.map(toAssessmentResult) }
+    : null;
+
+  const requirements = row.requirements.map((requirement) =>
+    toRequirementWithSources(requirement as never),
+  );
+
+  const requirementCountByDocument: Record<string, number> = {};
+  for (const requirement of requirements) {
+    requirementCountByDocument[requirement.documentId] =
+      (requirementCountByDocument[requirement.documentId] ?? 0) + 1;
+  }
+
+  // Failed chunks are on the extraction event, never on the document row: a
+  // document that completed with one chunk missing is still complete (§8).
+  const documentIds = row.documents.map((document) => document.id);
+  const extractionEvents = documentIds.length
+    ? await prisma.event.findMany({
+        where: { orgId, action: "extraction.completed", subjectId: { in: documentIds } },
+        orderBy: { createdAt: "desc" },
+        select: { subjectId: true, payload: true },
+      })
+    : [];
+  const failedChunksByDocument: Record<string, number> = {};
+  for (const event of extractionEvents) {
+    if (!event.subjectId || event.subjectId in failedChunksByDocument) continue;
+    const payload = asJsonObject(event.payload as never);
+    failedChunksByDocument[event.subjectId] = Number(
+      payload.chunksFailed ?? payload.failedChunks ?? 0,
+    );
+  }
+
+  const profileChangedAt = await getLastProfileChangeAt(orgId);
+  const keyDates = row.keyDates.map(toKeyDate);
+
+  return {
+    tender: toTender(row),
+    documents: row.documents.map(toDocument),
+    keyDates,
+    requirements,
+    latestAssessment,
+    assessmentVersions: versions,
+    submissionDeadline: pickSubmissionDeadline(keyDates),
+    clarificationDeadline:
+      keyDates.find((keyDate) => keyDate.kind === "clarification_deadline")?.occursAt ?? null,
+    profileChangedSinceAssessment: Boolean(
+      latest && profileChangedAt && profileChangedAt > latest.createdAt,
+    ),
+    requirementCountByDocument,
+    failedChunksByDocument,
+  };
+}
+
+/* ---------------------------------------------------------------------------
+ * Writes — each one transaction, each one event (§7.7).
+ * ------------------------------------------------------------------------- */
 
 export interface NewTenderInput {
   title: string;
@@ -29,217 +287,116 @@ export interface NewTenderInput {
   clarificationDeadline: Date | null;
 }
 
-/**
- * The submission deadline the evaluator uses: the earliest KeyDate of kind
- * submission_deadline. This is the only place that resolution lives (§7.5).
- */
-export async function getSubmissionDeadline(orgId: string, tenderId: string): Promise<Date | null> {
-  const store = getStore();
-  const dates = store.keyDates
-    .filter((k) => k.orgId === orgId && k.tenderId === tenderId && k.kind === "submission_deadline")
-    .sort((a, b) => a.occursAt.getTime() - b.occursAt.getTime());
-  return dates[0] ? new Date(dates[0].occursAt) : null;
-}
-
-function latestAssessmentFor(orgId: string, tenderId: string) {
-  const store = getStore();
-  return store.assessments
-    .filter((a) => a.orgId === orgId && a.tenderId === tenderId)
-    .sort((a, b) => b.version - a.version)[0];
-}
-
-function lastProfileChangeAt(orgId: string): Date | null {
-  const store = getStore();
-  const events = store.events.filter((e) => e.orgId === orgId && e.action === "profile.updated");
-  if (events.length === 0) return null;
-  return events.reduce((max, e) => (e.createdAt > max ? e.createdAt : max), events[0].createdAt);
-}
-
-export async function listPipeline(orgId: string): Promise<PipelineRow[]> {
-  const store = getStore();
-  const rows: PipelineRow[] = [];
-  for (const tender of store.tenders) {
-    if (tender.orgId !== orgId) continue;
-    const latest = latestAssessmentFor(orgId, tender.id);
-    rows.push({
-      tender: clone(tender),
-      latestAssessment: latest ? clone(latest) : null,
-      submissionDeadline: await getSubmissionDeadline(orgId, tender.id),
-      requirementCount: store.requirements.filter((r) => r.tenderId === tender.id).length,
-    });
-  }
-  // Sorted by submission deadline ascending; tenders without a deadline last.
-  return rows.sort((a, b) => {
-    if (!a.submissionDeadline && !b.submissionDeadline) return b.tender.createdAt.getTime() - a.tender.createdAt.getTime();
-    if (!a.submissionDeadline) return 1;
-    if (!b.submissionDeadline) return -1;
-    return a.submissionDeadline.getTime() - b.submissionDeadline.getTime();
-  });
-}
-
-export async function getTenderDetail(orgId: string, tenderId: string): Promise<TenderDetail | null> {
-  const store = getStore();
-  const tender = store.tenders.find((t) => t.id === tenderId && t.orgId === orgId);
-  if (!tender) return null;
-
-  const documents = store.documents.filter((d) => d.tenderId === tenderId).sort((a, b) => a.uploadedAt.getTime() - b.uploadedAt.getTime());
-  const docById = new Map(documents.map((d) => [d.id, d]));
-  const requirements = store.requirements
-    .filter((r) => r.tenderId === tenderId)
-    .map((r) => ({
-      ...clone(r),
-      document: clone(docById.get(r.documentId)!),
-      citations: store.citations
-        .filter((c) => c.requirementId === r.id)
-        .map((c) => ({ ...clone(c), document: clone(docById.get(c.documentId)!) })),
-    }));
-
-  const versions = store.assessments
-    .filter((a) => a.tenderId === tenderId && a.orgId === orgId)
-    .sort((a, b) => b.version - a.version);
-  const latest = versions[0];
-  const latestAssessment: AssessmentWithResults | null = latest
-    ? { ...clone(latest), results: clone(store.results.filter((r) => r.assessmentId === latest.id)) }
-    : null;
-
-  const keyDates = store.keyDates.filter((k) => k.tenderId === tenderId).sort((a, b) => a.occursAt.getTime() - b.occursAt.getTime());
-  const clarification = keyDates.find((k) => k.kind === "clarification_deadline");
-
-  const requirementCountByDocument: Record<string, number> = {};
-  for (const r of requirements) {
-    requirementCountByDocument[r.documentId] = (requirementCountByDocument[r.documentId] ?? 0) + 1;
-  }
-  const failedChunksByDocument: Record<string, number> = {};
-  for (const e of store.events) {
-    if (e.action === "extraction.completed" && e.subjectTable === "tender_documents" && e.subjectId && docById.has(e.subjectId)) {
-      failedChunksByDocument[e.subjectId] = Number(e.payload.failedChunks ?? 0);
+export async function createTender(
+  orgId: string,
+  userId: string,
+  input: NewTenderInput,
+): Promise<Tender> {
+  return prisma.$transaction(async (tx) => {
+    const keyDates: Array<{ kind: KeyDateKind; occursAt: Date }> = [];
+    if (input.submissionDeadline) {
+      keyDates.push({ kind: "submission_deadline", occursAt: input.submissionDeadline });
     }
-  }
+    if (input.clarificationDeadline) {
+      keyDates.push({ kind: "clarification_deadline", occursAt: input.clarificationDeadline });
+    }
 
-  const profileChangedAt = lastProfileChangeAt(orgId);
-  return {
-    tender: clone(tender),
-    documents: clone(documents),
-    keyDates: clone(keyDates),
-    requirements,
-    latestAssessment,
-    assessmentVersions: clone(versions),
-    submissionDeadline: await getSubmissionDeadline(orgId, tenderId),
-    clarificationDeadline: clarification ? new Date(clarification.occursAt) : null,
-    profileChangedSinceAssessment: Boolean(latest && profileChangedAt && profileChangedAt > latest.createdAt),
-    requirementCountByDocument,
-    failedChunksByDocument,
-  };
-}
-
-export async function listTenderSummaries(orgId: string): Promise<Array<Pick<Tender, "id" | "title" | "status">>> {
-  return getStore()
-    .tenders.filter((t) => t.orgId === orgId)
-    .map((t) => ({ id: t.id, title: t.title, status: t.status }))
-    .sort((a, b) => a.title.localeCompare(b.title));
-}
-
-export async function createTender(orgId: string, userId: string, input: NewTenderInput): Promise<Tender> {
-  const store = getStore();
-  const now = new Date();
-  const tender: Tender = {
-    id: newId(),
-    orgId,
-    title: input.title,
-    buyerName: input.buyerName,
-    source: input.source,
-    noticeReference: input.noticeReference,
-    sourceUrl: input.sourceUrl,
-    contractValue: input.contractValue,
-    currency: input.currency ?? "GBP",
-    durationMonths: input.durationMonths,
-    lotReference: input.lotReference,
-    status: "draft",
-    createdById: userId,
-    createdAt: now,
-    updatedAt: now,
-  };
-  store.tenders.push(tender);
-  if (input.submissionDeadline) {
-    store.keyDates.push({
-      id: newId(),
-      tenderId: tender.id,
-      orgId,
-      kind: "submission_deadline",
-      occursAt: input.submissionDeadline,
-      documentId: null,
-      pageNumber: null,
-      quotedClause: null,
-      createdAt: now,
+    const tender = await tx.tender.create({
+      data: {
+        orgId,
+        title: input.title,
+        buyerName: input.buyerName,
+        source: input.source,
+        noticeReference: input.noticeReference,
+        sourceUrl: input.sourceUrl,
+        contractValue: toDecimal(input.contractValue),
+        currency: input.currency ?? "GBP",
+        durationMonths: input.durationMonths,
+        lotReference: input.lotReference,
+        status: "draft",
+        createdById: userId,
+        keyDates: { create: keyDates.map((keyDate) => ({ ...keyDate, orgId })) },
+      },
     });
-  }
-  if (input.clarificationDeadline) {
-    store.keyDates.push({
-      id: newId(),
-      tenderId: tender.id,
+
+    await appendEvent(tx, {
       orgId,
-      kind: "clarification_deadline",
-      occursAt: input.clarificationDeadline,
-      documentId: null,
-      pageNumber: null,
-      quotedClause: null,
-      createdAt: now,
+      actorId: userId,
+      actorKind: "user",
+      action: "tender.created",
+      subjectTable: "tenders",
+      subjectId: tender.id,
+      payload: { tenderId: tender.id, title: tender.title, source: tender.source },
     });
-  }
-  appendEvent(store, {
-    orgId,
-    actorId: userId,
-    actorKind: "user",
-    action: "tender.created",
-    subjectTable: "tenders",
-    subjectId: tender.id,
-    payload: { tenderId: tender.id, title: tender.title, source: tender.source },
+    return toTender(tender);
   });
-  return clone(tender);
 }
 
+/**
+ * Marking a tender as a bid turns its ITT questions into workspace tasks (§10.2)
+ * — one state change, one event, one transaction. The tasks are part of the
+ * status change rather than N separate writes, and the count goes on the event
+ * so the audit log explains where they came from.
+ */
 export async function updateTenderStatus(
   orgId: string,
   userId: string,
   tenderId: string,
   status: TenderStatus,
 ): Promise<Tender> {
-  const store = getStore();
-  const tender = store.tenders.find((t) => t.id === tenderId && t.orgId === orgId);
-  if (!tender) throw new Error("Tender not found");
-  const from = tender.status;
-  tender.status = status;
-  tender.updatedAt = new Date();
+  return prisma.$transaction(async (tx) => {
+    const existing = await tx.tender.findFirst({ where: { id: tenderId, orgId } });
+    if (!existing) throw new Error("Tender not found");
+    const from = existing.status;
 
-  // Marking a tender as a bid turns its ITT questions into workspace tasks.
-  if (status === "bidding") {
-    for (const req of store.requirements.filter((r) => r.tenderId === tenderId && r.kind === "question")) {
-      const exists = store.tasks.some((t) => t.requirementId === req.id);
-      if (!exists) {
-        const now = new Date();
-        store.tasks.push({
-          id: newId(),
-          tenderId,
-          orgId,
-          requirementId: req.id,
-          title: req.summary,
-          assigneeId: null,
-          status: "not_started",
-          dueOn: null,
-          createdAt: now,
-          updatedAt: now,
-        });
-      }
-    }
-  }
-  appendEvent(store, {
-    orgId,
-    actorId: userId,
-    actorKind: "user",
-    action: "tender.status_changed",
-    subjectTable: "tenders",
-    subjectId: tenderId,
-    payload: { tenderId, from, to: status },
+    const tender = await tx.tender.update({ where: { id: tenderId }, data: { status } });
+    const tasksCreated = status === "bidding" ? await createTasksForQuestions(tx, orgId, tenderId) : 0;
+
+    await appendEvent(tx, {
+      orgId,
+      actorId: userId,
+      actorKind: "user",
+      action: "tender.status_changed",
+      subjectTable: "tenders",
+      subjectId: tenderId,
+      payload: {
+        tenderId,
+        from,
+        to: status,
+        ...(tasksCreated > 0 ? { tasksCreated } : {}),
+      },
+    });
+    return toTender(tender);
   });
-  return clone(tender);
 }
+
+/** One task per ITT question that does not have one yet. Idempotent. */
+async function createTasksForQuestions(tx: Tx, orgId: string, tenderId: string): Promise<number> {
+  const questions = await tx.requirement.findMany({
+    where: { orgId, tenderId, kind: "question", bidTasks: { none: {} } },
+    select: { id: true, summary: true },
+    orderBy: { createdAt: "asc" },
+  });
+  if (questions.length === 0) return 0;
+  const created = await tx.bidTask.createMany({
+    data: questions.map((question) => ({
+      tenderId,
+      orgId,
+      requirementId: question.id,
+      title: question.summary,
+      status: "not_started" as const,
+    })),
+  });
+  return created.count;
+}
+
+/** Kept for the assessment path, which sets `assessed` without a user action. */
+export async function markAssessed(tx: Tx, orgId: string, tenderId: string): Promise<void> {
+  const tender = await tx.tender.findFirst({ where: { id: tenderId, orgId }, select: { status: true } });
+  if (!tender) return;
+  if (tender.status === "draft" || tender.status === "extracted" || tender.status === "assessed") {
+    await tx.tender.update({ where: { id: tenderId }, data: { status: "assessed" } });
+  }
+}
+
+export type { Assessment };
