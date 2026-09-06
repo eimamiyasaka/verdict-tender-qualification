@@ -15,13 +15,19 @@
 import 'server-only';
 
 // Owned by feat/prisma-data-layer — imported, never defined here.
-import { persistExtraction } from '@/lib/db/ingest';
+import {
+  persistExtraction,
+  type PersistKeyDateInput,
+  type PersistRequirementInput,
+} from '@/lib/db/ingest';
 import { NO_REQUIREMENTS_MESSAGE, type DocumentExtractionOutcome } from '../../../contracts';
 import {
   prepareExtraction,
   prepareFailedExtraction,
   type PersistExtractionInput,
   type PrepareExtractionInput,
+  type PreparedKeyDate,
+  type PreparedRequirement,
 } from './prepare';
 
 export {
@@ -75,6 +81,34 @@ function resultFrom(
   };
 }
 
+/** `prepare.ts`'s shape has no notion of an actor or of the data layer's field names. */
+function toWriteRequirement(requirement: PreparedRequirement): PersistRequirementInput {
+  return {
+    kind: requirement.kind,
+    obligation: requirement.obligation,
+    summary: requirement.summary,
+    constraint: requirement.constraintJson,
+    pageNumber: requirement.pageNumber,
+    quotedClause: requirement.quotedClause,
+    clauseReference: requirement.clauseReference,
+    questionRef: requirement.questionRef,
+    wordLimit: requirement.wordLimit,
+    weighting: requirement.weighting,
+    extractionConfidence: requirement.extractionConfidence,
+    additionalCitations: requirement.additionalCitations,
+  };
+}
+
+function toWriteKeyDate(keyDate: PreparedKeyDate): PersistKeyDateInput {
+  return {
+    kind: keyDate.kind,
+    occursAt: new Date(keyDate.occursAt),
+    documentId: keyDate.documentId,
+    pageNumber: keyDate.pageNumber,
+    quotedClause: keyDate.quotedClause,
+  };
+}
+
 /**
  * Persists one document's extraction. Chunk failures are carried on the
  * outcome, not raised: one chunk failing does not fail the document, and the
@@ -83,9 +117,15 @@ function resultFrom(
 export async function persistDocumentExtraction(
   orgId: string,
   input: PrepareExtractionInput,
+  actorId: string | null,
 ): Promise<PersistExtractionResult> {
   const prepared = prepareExtraction(input);
-  const written = await persistExtraction(orgId, prepared.input);
+  const written = await persistExtraction(orgId, {
+    ...prepared.input,
+    actorId,
+    requirements: prepared.input.requirements.map(toWriteRequirement),
+    keyDates: prepared.input.keyDates.map(toWriteKeyDate),
+  });
   return resultFrom(prepared.input, written);
 }
 
@@ -102,8 +142,14 @@ export async function persistFailedExtraction(
     pageCount: number | null;
     message: string;
   },
+  actorId: string | null,
 ): Promise<PersistExtractionResult> {
   const payload = prepareFailedExtraction(input);
-  const written = await persistExtraction(orgId, payload);
+  const written = await persistExtraction(orgId, {
+    ...payload,
+    actorId,
+    requirements: payload.requirements.map(toWriteRequirement),
+    keyDates: payload.keyDates.map(toWriteKeyDate),
+  });
   return resultFrom(payload, written);
 }

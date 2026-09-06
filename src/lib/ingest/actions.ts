@@ -70,13 +70,13 @@ function revalidate(tenderId: string) {
 export async function saveExtractionAction(
   input: RecordExtractionInput,
 ): Promise<ExtractionRecordResult> {
-  const { orgId } = await getOrgContext();
+  const { orgId, userId } = await getOrgContext();
   const parsed = completedSchema.safeParse(input);
   if (!parsed.success) {
     return { ok: false, error: 'The extraction result was not understood and has not been saved.' };
   }
   try {
-    const result = await persistDocumentExtraction(orgId, parsed.data);
+    const result = await persistDocumentExtraction(orgId, parsed.data, userId);
     revalidate(parsed.data.tenderId);
     return { ok: true, ...result };
   } catch (error) {
@@ -92,13 +92,13 @@ export async function saveExtractionAction(
 export async function saveExtractionFailureAction(
   input: FailExtractionInput,
 ): Promise<ExtractionRecordResult> {
-  const { orgId } = await getOrgContext();
+  const { orgId, userId } = await getOrgContext();
   const parsed = failedSchema.safeParse(input);
   if (!parsed.success) {
     return { ok: false, error: 'The extraction failure was not understood and has not been saved.' };
   }
   try {
-    const result = await persistFailedExtraction(orgId, parsed.data);
+    const result = await persistFailedExtraction(orgId, parsed.data, userId);
     revalidate(parsed.data.tenderId);
     return { ok: true, ...result };
   } catch (error) {

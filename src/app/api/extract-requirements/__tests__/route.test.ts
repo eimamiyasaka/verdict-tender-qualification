@@ -21,7 +21,7 @@ import { sampleChunkRequest, sampleDrafts } from '../../../../../fixtures/extrac
 const parseMock = vi.fn();
 
 vi.mock('@/lib/auth/session', () => ({
-  getSession: vi.fn(async () => ({ userId: 'user-1' })),
+  getSession: vi.fn(async () => ({ userId: 'user-1', email: 'user-1@example.com' })),
 }));
 
 // Only the client is replaced; the SDK's real error classes stay, so the
@@ -64,7 +64,7 @@ function modelMessage(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   process.env.ANTHROPIC_API_KEY = 'sk-ant-test';
   parseMock.mockReset();
-  vi.mocked(getSession).mockResolvedValue({ userId: 'user-1' });
+  vi.mocked(getSession).mockResolvedValue({ userId: 'user-1', email: 'user-1@example.com' });
 });
 
 afterEach(() => {
