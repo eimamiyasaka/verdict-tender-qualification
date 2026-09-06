@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# environment — .env holds the Supabase password; only the example is committed
+.env
+.env.*
+!.env.example
+
+# prisma
+prisma/*.db
+prisma/*.db-journal
+
+# misc
+*.log
+.DS_Store

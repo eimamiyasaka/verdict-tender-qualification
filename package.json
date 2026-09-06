@@ -1,0 +1,24 @@
+{
+  "name": "verdict",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Verdict — tender qualification platform. Database layer: Prisma schema and migrations against Supabase Postgres.",
+  "scripts": {
+    "postinstall": "prisma generate",
+    "db:generate": "prisma generate",
+    "db:validate": "prisma validate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:status": "prisma migrate status",
+    "db:studio": "prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3"
+  },
+  "devDependencies": {
+    "prisma": "6.19.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
