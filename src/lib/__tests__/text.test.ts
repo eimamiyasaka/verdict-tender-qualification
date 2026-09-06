@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
+import { wordCountCases } from "../../../fixtures";
 import { countWords, excerpt, searchTerms } from "../text";
 
 describe("countWords", () => {
   it("returns 0 for the empty string", () => {
     expect(countWords("")).toBe(0);
   });
+  // Spec §7.7: the old schema's generated column claimed one word for every empty
+  // draft, so the empty string is the first case and the fixtures pin the rest.
+  for (const { body, expected } of wordCountCases) {
+    it(`counts ${JSON.stringify(body)} as ${expected}`, () => {
+      expect(countWords(body)).toBe(expected);
+    });
+  }
   it("returns 0 for whitespace only", () => {
     expect(countWords("   \n\t ")).toBe(0);
   });
