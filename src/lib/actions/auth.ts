@@ -1,13 +1,22 @@
 "use server";
 
 import { redirect } from "next/navigation";
+import { safeNextPath } from "@/lib/auth/next-path";
 import { signInDemo, signInWithPassword } from "@/lib/auth/sign-in";
 import { signOut } from "@/lib/auth/sign-out";
 import { fail, type ActionState, str } from "./shared";
 
-function safeNext(value: string | null): string {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "/";
-  return value;
+/**
+ * Both sign-in paths run on the server. The demo one has to: `DEMO_EMAIL` and
+ * `DEMO_PASSWORD` are server-side env and must never reach the client bundle
+ * (§12.2).
+ *
+ * Success goes to /auth/callback rather than straight to `next`, because that
+ * route is the single place the users mirror row is created (§7.3).
+ */
+function callbackUrl(formData: FormData): string {
+  const next = safeNextPath(str(formData, "next") || null);
+  return `/auth/callback?next=${encodeURIComponent(next)}`;
 }
 
 export async function signInAction(_prev: ActionState, formData: FormData): Promise<ActionState> {
@@ -20,13 +29,13 @@ export async function signInAction(_prev: ActionState, formData: FormData): Prom
 
   const result = await signInWithPassword(email, password);
   if (!result.ok) return fail(result.error);
-  redirect(safeNext(str(formData, "next") || null));
+  redirect(callbackUrl(formData));
 }
 
 export async function viewDemoAction(formData: FormData): Promise<void> {
   const result = await signInDemo();
   if (!result.ok) redirect("/login?error=demo");
-  redirect(safeNext(str(formData, "next") || null));
+  redirect(callbackUrl(formData));
 }
 
 export async function signOutAction(): Promise<void> {
