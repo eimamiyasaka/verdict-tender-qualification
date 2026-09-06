@@ -1,7 +1,8 @@
 "use server";
 
 import { redirect } from "next/navigation";
-import { signInDemo, signInWithPassword, signOut } from "@/lib/auth/session";
+import { signInDemo, signInWithPassword } from "@/lib/auth/sign-in";
+import { signOut } from "@/lib/auth/sign-out";
 import { fail, type ActionState, str } from "./shared";
 
 function safeNext(value: string | null): string {
