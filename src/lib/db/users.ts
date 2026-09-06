@@ -1,42 +1,49 @@
 /**
- * Users and memberships (§7.3). A user belongs to exactly one organisation in v1.
+ * Compatibility surface for the screens and the placeholder session helper.
  *
- * Prisma seam: replace the store reads with `prisma.user` / `prisma.membership` queries.
+ * `org.ts` is canonical: it holds the two audited exceptions to §6.3 in the
+ * shapes the auth branch was given (`upsertUser`, `getMembershipForUser →
+ * { orgId, role, orgName }`). This module exists because `src/lib/auth/session.
+ * ts` and `/tenders/[id]` on `main` were written against a richer membership
+ * shape while the data layer was still an in-memory store, and neither file is
+ * this branch's to edit.
+ *
+ * Nothing new belongs here. When Supabase Auth lands and `session.ts` is
+ * rewritten against `org.ts`, this file goes with it.
  */
+
 import type { Membership, Organisation, OrgRole, User } from "@/lib/types";
-import { clone, getStore } from "./_placeholder/store";
+import { prisma, type Db } from "./client";
+import { toOrganisation, toUser } from "./org";
 
-export async function getUserById(id: string): Promise<User | null> {
-  const user = getStore().users.find((u) => u.id === id);
-  return user ? clone(user) : null;
-}
+export { getUserById, getUserByEmail, listOrgMembers, getOrganisation } from "./org";
 
-export async function getUserByEmail(email: string): Promise<User | null> {
-  const needle = email.trim().toLowerCase();
-  const user = getStore().users.find((u) => u.email.toLowerCase() === needle);
-  return user ? clone(user) : null;
-}
-
-/** The single membership for a user, with its organisation. Null when the user has none. */
+/**
+ * The membership plus its organisation, which is what `getOrgContext()` needs
+ * to build an `OrgContext` in one call. `org.ts` holds the narrow version.
+ */
 export async function getMembershipForUser(
   userId: string,
+  db: Db = prisma,
 ): Promise<{ membership: Membership; organisation: Organisation } | null> {
-  const store = getStore();
-  const membership = store.memberships.find((m) => m.userId === userId);
-  if (!membership) return null;
-  const organisation = store.organisations.find((o) => o.id === membership.orgId);
-  if (!organisation) return null;
-  return { membership: clone(membership), organisation: clone(organisation) };
+  const row = await db.membership.findFirst({
+    where: { userId },
+    orderBy: { createdAt: "asc" },
+    include: { organisation: true },
+  });
+  if (!row) return null;
+  return {
+    membership: {
+      id: row.id,
+      orgId: row.orgId,
+      userId: row.userId,
+      role: row.role as OrgRole,
+      createdAt: row.createdAt,
+    },
+    organisation: toOrganisation(row.organisation),
+  };
 }
 
-export async function listOrgMembers(orgId: string): Promise<Array<User & { role: OrgRole }>> {
-  const store = getStore();
-  return store.memberships
-    .filter((m) => m.orgId === orgId)
-    .map((m) => {
-      const user = store.users.find((u) => u.id === m.userId);
-      return user ? { ...clone(user), role: m.role } : null;
-    })
-    .filter((u): u is User & { role: OrgRole } => u !== null)
-    .sort((a, b) => (a.displayName ?? a.email).localeCompare(b.displayName ?? b.email));
-}
+/** Re-exported for symmetry with the placeholder module this replaces. */
+export type { User };
+export { toUser };
