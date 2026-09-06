@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+/*
+  Verdict design tokens (spec §11, §12.1).
+
+  Five colours. No gradients, no shadows, no green. A passing requirement gets
+  no colour at all; only problems are coloured. These five CSS variables are the
+  only colour values in the codebase — Tailwind's default palette is wiped below
+  so nothing else can be used by accident.
+*/
+:root {
+  --ink: #161719;
+  --paper: #fbfbf9;
+  --rule: #deddd6;
+  --flag: #b3261e;
+  --pending: #8a6d1f;
+}
+
+
+@theme {
+  --color-*: initial;
+  --radius-*: initial;
+  --shadow-*: initial;
+  --inset-shadow-*: initial;
+  --drop-shadow-*: initial;
+  --text-shadow-*: initial;
+}
+
+@theme inline {
+  --color-ink: var(--ink);
+  --color-paper: var(--paper);
+  --color-rule: var(--rule);
+  --color-flag: var(--flag);
+  --color-pending: var(--pending);
+
+  --font-sans: var(--font-inter-tight), "Inter Tight", "Inter", system-ui, sans-serif;
+  --font-mono: var(--font-plex-mono), "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+
+  /* Cards: 1px border, 2px radius. */
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
+
+  --container-content: 1100px;
+
+  /* The drawer slide is the only animation in the application (§11, §12.6). */
+  --animate-drawer-in: drawer-in 320ms ease-out both;
+  --animate-drawer-out: drawer-out 320ms ease-out both;
+  --animate-veil-in: veil-in 320ms ease-out both;
+  --animate-veil-out: veil-out 320ms ease-out both;
+
+  @keyframes drawer-in {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+  }
+  @keyframes drawer-out {
+    from { transform: translateX(0); }
+    to { transform: translateX(100%); }
+  }
+  @keyframes veil-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes veil-out {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+    background: var(--paper);
+  }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  /* Visible keyboard focus on every interactive element (§12.7). */
+  :focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+  }
+  ::selection {
+    background: var(--ink);
+    color: var(--paper);
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+/* Citations look like citations: mono, ~0.85em, ink at 60% (§11). */
+@utility cite {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: color-mix(in srgb, var(--ink) 60%, transparent);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+/* The verdict word: mono, uppercase, wide letter-spacing (§12.3, §12.4). */
+@utility verdict-word {
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Section labels such as BLOCKING / NEEDS AN ANSWER FROM YOU (§12.5). */
+@utility section-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-weight: 500;
+}
+
+@utility tabular {
+  font-variant-numeric: tabular-nums;
+}
