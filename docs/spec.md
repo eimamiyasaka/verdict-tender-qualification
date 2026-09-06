@@ -4,7 +4,7 @@
 
 Written before the build clock starts.
 
-**Read order for any agent session:** this file, then `contracts.ts`, then your brief in `prompts/`. Both are read-only. If you need a change to either, stop and ask.
+**Read order for any agent session:** this file, then `contracts.ts`. Both are read-only. If you need a change to either, stop and ask.
 
 ---
 
