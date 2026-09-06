@@ -5,8 +5,15 @@ import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { formatBytes } from "@/lib/format";
 import { DOCUMENT_TYPE_LABEL } from "@/lib/labels";
-import { guessDocType, MAX_FILES, MAX_UPLOAD_BYTES, runExtraction, type ItemProgress, type UploadItem } from "@/lib/ingest/run-extraction";
-import { DOCUMENT_TYPES, type DocumentType } from "@/lib/types";
+import {
+  guessDocType,
+  runExtraction,
+  screenSelection,
+  type ItemProgress,
+  type UploadItem,
+} from "@/lib/ingest/run-extraction";
+import { DOCUMENT_TYPES, MAX_DOCUMENTS_PER_TENDER, MAX_UPLOAD_BYTES } from "../../../contracts";
+import type { DocumentType } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 interface Picked extends UploadItem {
@@ -14,10 +21,11 @@ interface Picked extends UploadItem {
 }
 
 /**
- * Multi-document upload typed by role (§8 step 1). Files over 20MB are
- * rejected client-side with the size named (§14). Progress is per document
- * and per chunk; errors are the stored messages, in full. Finished files move
- * to a results list so they are never extracted twice by accident.
+ * Multi-document upload typed by role (§8 step 1). Files over the limit are
+ * rejected client-side before anything is parsed, with the size named, and a
+ * pack over six documents is rejected with the count named — both messages
+ * come from contracts.ts. Progress is per document and per chunk; a failed
+ * chunk is shown as a count, never hidden behind a completed document.
  */
 export function UploadPanel({ tenderId, existingCount }: { tenderId: string; existingCount: number }) {
   const router = useRouter();
@@ -25,34 +33,47 @@ export function UploadPanel({ tenderId, existingCount }: { tenderId: string; exi
   const [picked, setPicked] = React.useState<Picked[]>([]);
   const [finished, setFinished] = React.useState<Picked[]>([]);
   const [progress, setProgress] = React.useState<Record<string, ItemProgress>>({});
+  const [selectionError, setSelectionError] = React.useState<string | null>(null);
   const [running, setRunning] = React.useState(false);
   const [dragging, setDragging] = React.useState(false);
 
   // `existingCount` already includes documents added by the last run once the page refreshes.
-  const remainingSlots = Math.max(0, MAX_FILES - existingCount - picked.length);
+  const remainingSlots = Math.max(0, MAX_DOCUMENTS_PER_TENDER - existingCount - picked.length);
 
   function addFiles(list: FileList | File[]) {
     const incoming = Array.from(list);
     setFinished([]);
     setProgress({});
     setPicked((current) => {
-      const next = [...current];
-      for (const file of incoming) {
-        if (next.length >= MAX_FILES - existingCount) break;
-        if (next.some((p) => p.file.name === file.name && p.file.size === file.size)) continue;
-        let error: string | null = null;
-        const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
-        if (!isPdf) error = "Not a PDF. Verdict reads PDF packs only.";
-        else if (file.size > MAX_UPLOAD_BYTES)
-          error = `${formatBytes(file.size)} is over the 20 MB limit. Split the pack or ask the buyer for a smaller file.`;
-        next.push({ id: `${file.name}-${file.size}-${file.lastModified}`, file, docType: guessDocType(file.name), error });
-      }
-      return next;
+      const fresh = incoming.filter(
+        (file) => !current.some((p) => p.file.name === file.name && p.file.size === file.size),
+      );
+      const screened = screenSelection(
+        [...current.map((p) => p.file), ...fresh],
+        existingCount,
+      );
+      setSelectionError(screened.selectionError);
+      return screened.files.map((entry, index) => {
+        const existing = current[index];
+        return {
+          id:
+            existing?.id ??
+            `${entry.file.name}-${entry.file.size}-${entry.file.lastModified}`,
+          file: entry.file,
+          docType: existing?.docType ?? guessDocType(entry.file.name),
+          error: entry.error,
+        };
+      });
     });
   }
 
   function remove(id: string) {
-    setPicked((current) => current.filter((p) => p.id !== id));
+    setPicked((current) => {
+      const next = current.filter((p) => p.id !== id);
+      const screened = screenSelection(next.map((p) => p.file), existingCount);
+      setSelectionError(screened.selectionError);
+      return next;
+    });
   }
 
   function setType(id: string, docType: DocumentType) {
@@ -61,7 +82,7 @@ export function UploadPanel({ tenderId, existingCount }: { tenderId: string; exi
 
   async function start() {
     const valid = picked.filter((p) => !p.error);
-    if (valid.length === 0) return;
+    if (valid.length === 0 || selectionError) return;
     setRunning(true);
     setProgress(Object.fromEntries(valid.map((v) => [v.id, { stage: "queued" } as ItemProgress])));
     try {
@@ -86,8 +107,9 @@ export function UploadPanel({ tenderId, existingCount }: { tenderId: string; exi
           Add documents
         </h2>
         <p className="mt-1 text-[13px] text-ink/70">
-          Up to {MAX_FILES} PDFs per tender, 20 MB each, text-based. Files are read in your browser; only their text is sent for
-          extraction and the file itself is not stored.
+          Up to {MAX_DOCUMENTS_PER_TENDER} PDFs per tender, {MAX_UPLOAD_BYTES / (1024 * 1024)} MB each,
+          text-based. Files are read in your browser; only their text is sent for extraction and the file
+          itself is not stored.
         </p>
       </div>
 
@@ -150,6 +172,12 @@ export function UploadPanel({ tenderId, existingCount }: { tenderId: string; exi
         </p>
       </div>
 
+      {selectionError ? (
+        <p role="alert" className="text-[13px] leading-relaxed text-flag">
+          {selectionError}
+        </p>
+      ) : null}
+
       {picked.length > 0 ? (
         <ul className="divide-y divide-rule rounded-sm border border-rule" aria-label="Files to extract">
           {picked.map((p) => {
@@ -196,13 +224,25 @@ export function UploadPanel({ tenderId, existingCount }: { tenderId: string; exi
 
       {picked.length > 0 ? (
         <div className="flex flex-wrap items-center gap-3">
-          <Button type="button" onClick={start} disabled={running || validCount === 0} aria-busy={running}>
+          <Button
+            type="button"
+            onClick={start}
+            disabled={running || validCount === 0 || Boolean(selectionError)}
+            aria-busy={running}
+          >
             {running
               ? "Extracting requirements…"
               : `Extract requirements from ${validCount} ${validCount === 1 ? "file" : "files"}`}
           </Button>
           {!running ? (
-            <Button type="button" variant="ghost" onClick={() => setPicked([])}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setPicked([]);
+                setSelectionError(null);
+              }}
+            >
               Clear
             </Button>
           ) : null}
@@ -223,38 +263,42 @@ function ProgressLine({ state }: { state: ItemProgress }) {
       text = "Adding to the tender…";
       break;
     case "reading":
-      text = state.total ? `Reading pages… ${state.done} of ${state.total}` : "Opening the PDF…";
+      text = state.pageCount ? `Reading pages… ${state.pagesRead} of ${state.pageCount}` : "Opening the PDF…";
       break;
     case "extracting":
       text = (
         <>
-          Extracting… {state.done} of {state.total} chunks
-          {state.failed > 0 ? <span className="text-flag"> · {state.failed} failed</span> : null}
+          Extracting… {state.chunksDone} of {state.chunksTotal} chunks
+          {state.chunksFailed > 0 ? <span className="text-flag"> · {state.chunksFailed} failed</span> : null}
         </>
       );
       break;
-    case "recording":
+    case "saving":
       text = "Saving requirements…";
       break;
-    case "complete":
+    case "complete": {
+      const { outcome } = state;
       tone = "text-ink";
-      text =
-        state.requirementsFound === 0 && state.citationsAdded === 0 ? (
-          "No requirements found in this document — check it's the right file, or the type tag."
-        ) : (
-          <>
-            Done — {state.requirementsFound} {state.requirementsFound === 1 ? "requirement" : "requirements"}
-            {state.citationsAdded > 0 ? `, ${state.citationsAdded} merged as extra citations` : ""}
-            {state.heldForReview > 0 ? `, ${state.heldForReview} held for review` : ""}
-            {state.failedChunks > 0 ? (
-              <span className="text-flag">
-                {" "}
-                · {state.failedChunks} of {state.chunkCount} chunks failed
-              </span>
-            ) : null}
-          </>
-        );
+      text = state.message ? (
+        <span className="text-pending">{state.message}</span>
+      ) : (
+        <>
+          Done — {outcome.requirementsCreated}{" "}
+          {outcome.requirementsCreated === 1 ? "requirement" : "requirements"}
+          {outcome.citationsCreated > 0 ? `, ${outcome.citationsCreated} merged as extra citations` : ""}
+          {outcome.draftsHeldForReview > 0 ? `, ${outcome.draftsHeldForReview} held for review` : ""}
+          {outcome.draftsRejected > 0 ? `, ${outcome.draftsRejected} rejected` : ""}
+          {state.keyDatesCreated > 0 ? `, ${state.keyDatesCreated} key dates` : ""}
+          {outcome.chunksFailed > 0 ? (
+            <span className="text-flag">
+              {" "}
+              · {outcome.chunksFailed} of {outcome.chunksTotal} chunks failed
+            </span>
+          ) : null}
+        </>
+      );
       break;
+    }
     case "failed":
       tone = "text-flag";
       text = state.message;

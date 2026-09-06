@@ -2,7 +2,7 @@ import { Cite } from "@/components/common/typography";
 import { DeleteDocumentForm } from "@/components/tender/delete-document-form";
 import { UploadPanel } from "@/components/upload/upload-panel";
 import { DOCUMENT_TYPE_LABEL, EXTRACTION_STATUS_LABEL } from "@/lib/labels";
-import { MAX_FILES } from "@/lib/ingest/run-extraction";
+import { MAX_DOCUMENTS_PER_TENDER, NO_REQUIREMENTS_MESSAGE } from "../../../contracts";
 import type { TenderDetail } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -64,7 +64,7 @@ export function DocumentsTab({ detail, closed }: { detail: TenderDetail; closed:
                       ) : null}
                       {status === "complete" && found === 0 && failedChunks === 0 ? (
                         <p className="mt-1 max-w-md text-[13px] leading-relaxed text-pending">
-                          No requirements found in this document — check it&apos;s the right file, or the type tag.
+                          {NO_REQUIREMENTS_MESSAGE}
                         </p>
                       ) : null}
                     </td>
@@ -82,8 +82,8 @@ export function DocumentsTab({ detail, closed }: { detail: TenderDetail; closed:
 
       {closed ? (
         <p className="text-sm text-ink/70">The submission deadline has passed, so no more documents can be added.</p>
-      ) : documents.length >= MAX_FILES ? (
-        <p className="text-sm text-ink/70">This tender has its full set of {MAX_FILES} documents. Remove one to add another.</p>
+      ) : documents.length >= MAX_DOCUMENTS_PER_TENDER ? (
+        <p className="text-sm text-ink/70">This tender has its full set of {MAX_DOCUMENTS_PER_TENDER} documents. Remove one to add another.</p>
       ) : (
         <UploadPanel tenderId={tender.id} existingCount={documents.length} />
       )}
